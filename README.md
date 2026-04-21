@@ -13,8 +13,27 @@
 | Content-Type (요청) | `multipart/form-data` |
 | `file` (필수) | 원본 비디오 바이너리 |
 | `profile` (옵션) | `web-h264` (기본, 향후 확장) |
+| `async_job` (옵션) | `true`면 비동기 잡 생성 모드로 동작 |
 | 응답 Content-Type | `video/mp4` |
 | 응답 Body | 변환된 MP4 (스트리밍) |
+
+#### 동기 모드 (기본)
+
+- `async_job` 미지정(또는 `false`)이면 기존처럼 변환된 MP4를 바로 스트리밍 응답한다.
+
+#### 비동기 모드 (`async_job=true`)
+
+- `202 Accepted` + `application/json` 응답:
+
+```json
+{
+  "jobId": "....",
+  "statusUrl": "http://<host>/v1/normalize/jobs/<jobId>",
+  "resultUrl": "http://<host>/v1/normalize/jobs/<jobId>/result"
+}
+```
+
+- `statusUrl`, `resultUrl`는 절대 URL로 반환된다.
 
 **응답 헤더**
 
@@ -54,10 +73,11 @@ Prometheus exposition format.
 ### 디코딩 진행률용 비동기 API
 
 - `POST /v1/normalize/jobs` : 업로드 + 잡 생성 (`202 Accepted`)
-- `GET /v1/normalize/jobs/{jobId}` : `{status, progress}` 폴링
+- `GET /v1/normalize/jobs/{jobId}` : `{status, state, progress}` 폴링
 - `GET /v1/normalize/jobs/{jobId}/result` : 완료 후 MP4 스트리밍 반환
 
 `progress` 는 ffmpeg `-progress pipe:2` 출력(`out_time_ms`) 기반 추정치로, 긴 디코딩 구간을 프런트에서 `decoding` 퍼센트로 표시할 수 있다.
+`state`는 `status`와 동일 값(호환용 alias)이다.
 
 ---
 
@@ -185,6 +205,18 @@ docker run --rm -p 8000:8000 \
 
 컨테이너 내부 포트는 `8000` (Dockerfile `ENV PORT=8000`). 로컬 개발(`python -m app.main`)은 코드 기본값 `8080` 사용.
 
+#### 소스 변경 시 재빌드 없이 개발하기
+
+`UVICORN_RELOAD=1` + bind mount로 실행하면 코드 변경이 컨테이너에서 자동 반영된다.
+
+```bash
+docker run --rm -p 8000:8000 \
+  -e ALLOWED_ORIGINS=http://localhost:3000 \
+  -e UVICORN_RELOAD=1 \
+  -v "$(pwd)/app:/srv/app" \
+  videonizer-normalize
+```
+
 ### 클라이언트 설정
 
 ```bash
@@ -210,6 +242,5 @@ NEXT_PUBLIC_VIDEO_NORMALIZE_ENDPOINT=http://localhost:8080/v1/normalize
 
 - F-4.4 NVENC/QSV/VAAPI 프로필 — CRF/bitrate 튜닝 후 `FFMPEG_EXTRA_ARGS` 로 주입하거나 `profile` 파라미터 매핑
 - F-5.5 인증 — 단기 서명 토큰 헤더 검증 미들웨어
-- F-6.2 비동기 잡 API — `POST /jobs` / `GET /jobs/{id}` / `GET /jobs/{id}/result` (클라이언트 어댑터도 교체 필요)
 - F-8.1 진행률 스트리밍 — ffmpeg stderr 파싱 → SSE 또는 `X-Progress` 트레일러
 - 수용 기준 통합 테스트 — 실제 샘플 영상 픽스처로 Chrome/Safari/Firefox 재생 회귀
