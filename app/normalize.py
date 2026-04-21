@@ -6,9 +6,10 @@ import os
 import signal
 import time
 import uuid
+import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import AsyncIterator
+from typing import AsyncIterator, Awaitable, Callable
 
 from .config import Settings
 from .errors import FfmpegFailed, JobTimeout
@@ -79,7 +80,27 @@ def build_ffmpeg_cmd(
     return cmd
 
 
-async def _run_ffmpeg(cmd: list[str], timeout_s: float) -> tuple[int, str]:
+ProgressCallback = Callable[[float], Awaitable[None] | None]
+
+
+def _extract_progress_fraction(stderr_text: str, duration_s: float) -> float | None:
+    if duration_s <= 0:
+        return None
+    matches = re.findall(r"out_time_ms=(\d+)", stderr_text)
+    if not matches:
+        return None
+    latest_ms = int(matches[-1])
+    fraction = latest_ms / (duration_s * 1_000_000)
+    return max(0.0, min(1.0, fraction))
+
+
+async def _run_ffmpeg(
+    cmd: list[str],
+    timeout_s: float,
+    *,
+    progress_cb: ProgressCallback | None = None,
+    duration_s: float = 0.0,
+) -> tuple[int, str]:
     logger.info("ffmpeg.spawn", extra={"argv": cmd})
     # start_new_session=True so we can signal the whole process group on timeout.
     proc = await asyncio.create_subprocess_exec(
@@ -102,6 +123,12 @@ async def _run_ffmpeg(cmd: list[str], timeout_s: float) -> tuple[int, str]:
             pass
         raise JobTimeout(timeout_s)
     stderr_text = (stderr or b"").decode(errors="ignore")
+    if progress_cb is not None:
+        frac = _extract_progress_fraction(stderr_text, duration_s)
+        if frac is not None:
+            maybe = progress_cb(frac)
+            if asyncio.iscoroutine(maybe):
+                await maybe
     return proc.returncode or 0, stderr_text
 
 
@@ -110,6 +137,7 @@ async def normalize_file(
     work_dir: Path,
     settings: Settings,
     job_id: str | None = None,
+    progress_cb: ProgressCallback | None = None,
 ) -> NormalizeOutcome:
     """Run ffprobe + ffmpeg on `input_path`, writing an MP4 into `work_dir`."""
     job_id = job_id or uuid.uuid4().hex
@@ -123,10 +151,15 @@ async def normalize_file(
         input_path=input_path,
         output_path=output_path,
         probe=probe,
-        extra_args=settings.ffmpeg_extra_args_list,
+        extra_args=["-progress", "pipe:2", "-nostats", *settings.ffmpeg_extra_args_list],
     )
 
-    rc, stderr = await _run_ffmpeg(cmd, settings.job_timeout_s)
+    rc, stderr = await _run_ffmpeg(
+        cmd,
+        settings.job_timeout_s,
+        progress_cb=progress_cb,
+        duration_s=probe.duration,
+    )
     if rc != 0 or not output_path.exists() or output_path.stat().st_size == 0:
         raise FfmpegFailed(stderr)
 

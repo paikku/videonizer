@@ -9,7 +9,8 @@ import time
 import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import AsyncIterator
+from dataclasses import dataclass, field
+from typing import AsyncIterator, Literal
 
 from fastapi import FastAPI, Header, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
@@ -28,12 +29,26 @@ logger = logging.getLogger("videonizer.api")
 UPLOAD_CHUNK = 1024 * 1024  # 1 MiB
 
 
+@dataclass
+class NormalizeJob:
+    id: str
+    status: Literal["queued", "processing", "done", "failed"]
+    progress: float = 0.0
+    message: str | None = None
+    output_path: Path | None = None
+    work_dir: Path | None = None
+    headers: dict[str, str] = field(default_factory=dict)
+    created_at_ms: int = field(default_factory=lambda: int(time.time() * 1000))
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     settings = get_settings()
     configure_logging(settings.log_level)
     app.state.settings = settings
     app.state.limiter = JobLimiter(settings.max_concurrent_jobs)
+    app.state.jobs: dict[str, NormalizeJob] = {}
+    app.state.jobs_lock = asyncio.Lock()
     app.state.ffmpeg_ok = await _check_binary(settings.ffmpeg_path)
     app.state.ffprobe_ok = await _check_binary(settings.ffprobe_path)
     logger.info(
@@ -124,6 +139,60 @@ async def _stream_to_disk(upload: UploadFile, dest: Path, limit: int) -> int:
     return total
 
 
+async def _run_normalize_job(
+    *,
+    request: Request,
+    file: UploadFile,
+    job_id: str,
+    work_dir: Path,
+    progress_cb=None,
+) -> tuple[Path, dict[str, str]]:
+    settings: Settings = request.app.state.settings
+    limiter: JobLimiter = request.app.state.limiter
+    input_path = work_dir / f"{job_id}.in"
+    log_extra: dict[str, object] = {"job_id": job_id}
+
+    input_bytes = await _stream_to_disk(file, input_path, settings.max_upload_bytes)
+    log_extra["input_bytes"] = input_bytes
+    metrics.INPUT_BYTES.observe(input_bytes)
+
+    async with limiter.slot():
+        outcome = await normalize_file(
+            input_path=input_path,
+            work_dir=work_dir,
+            settings=settings,
+            job_id=job_id,
+            progress_cb=progress_cb,
+        )
+
+    output_size = outcome.output_path.stat().st_size
+    metrics.OUTPUT_BYTES.observe(output_size)
+    metrics.JOB_DURATION_SECONDS.labels(
+        mode="remux" if outcome.remuxed else "encode"
+    ).observe(outcome.duration_ms / 1000.0)
+    metrics.JOBS_TOTAL.labels(outcome="success").inc()
+
+    log_extra.update(
+        {
+            "output_bytes": output_size,
+            "duration_ms": outcome.duration_ms,
+            "input_codec": outcome.probe.video_codec,
+            "input_format": outcome.probe.format_name,
+            "remuxed": outcome.remuxed,
+            "success": True,
+        }
+    )
+    logger.info("normalize.done", extra=log_extra)
+    headers = {
+        "Content-Length": str(output_size),
+        "X-Normalize-Duration-Ms": str(outcome.duration_ms),
+        "X-Normalize-Input-Codec": outcome.probe.video_codec or "unknown",
+        "X-Normalize-Remuxed": "1" if outcome.remuxed else "0",
+        "Cache-Control": "no-store",
+    }
+    return outcome.output_path, headers
+
+
 # Routes ----------------------------------------------------------------------
 
 
@@ -158,7 +227,6 @@ async def normalize(
     content_length: int | None = Header(default=None, alias="Content-Length"),
 ) -> Response:
     settings: Settings = request.app.state.settings
-    limiter: JobLimiter = request.app.state.limiter
 
     # Short-circuit on Content-Length when present (F-1.2).
     if content_length is not None and content_length > settings.max_upload_bytes:
@@ -170,51 +238,15 @@ async def normalize(
 
     job_id = uuid.uuid4().hex
     work_dir = Path(tempfile.mkdtemp(prefix="normalize-", dir=settings.temp_dir))
-    input_path = work_dir / f"{job_id}.in"
     started = time.monotonic()
-    log_extra: dict[str, object] = {"job_id": job_id}
 
     try:
-        input_bytes = await _stream_to_disk(file, input_path, settings.max_upload_bytes)
-        log_extra["input_bytes"] = input_bytes
-        metrics.INPUT_BYTES.observe(input_bytes)
-
-        async with limiter.slot():
-            outcome = await normalize_file(
-                input_path=input_path,
-                work_dir=work_dir,
-                settings=settings,
-                job_id=job_id,
-            )
-
-        output_size = outcome.output_path.stat().st_size
-        metrics.OUTPUT_BYTES.observe(output_size)
-        metrics.JOB_DURATION_SECONDS.labels(
-            mode="remux" if outcome.remuxed else "encode"
-        ).observe(outcome.duration_ms / 1000.0)
-        metrics.JOBS_TOTAL.labels(outcome="success").inc()
-
-        log_extra.update(
-            {
-                "output_bytes": output_size,
-                "duration_ms": outcome.duration_ms,
-                "input_codec": outcome.probe.video_codec,
-                "input_format": outcome.probe.format_name,
-                "remuxed": outcome.remuxed,
-                "success": True,
-            }
+        output_path, headers = await _run_normalize_job(
+            request=request,
+            file=file,
+            job_id=job_id,
+            work_dir=work_dir,
         )
-        logger.info("normalize.done", extra=log_extra)
-
-        headers = {
-            "Content-Length": str(output_size),
-            "X-Normalize-Duration-Ms": str(outcome.duration_ms),
-            "X-Normalize-Input-Codec": outcome.probe.video_codec or "unknown",
-            "X-Normalize-Remuxed": "1" if outcome.remuxed else "0",
-            "Cache-Control": "no-store",
-        }
-
-        output_path = outcome.output_path
 
         async def streamer() -> AsyncIterator[bytes]:
             try:
@@ -233,24 +265,135 @@ async def normalize(
     except NormalizeError as exc:
         shutil.rmtree(work_dir, ignore_errors=True)
         metrics.JOBS_TOTAL.labels(outcome=exc.code).inc()
-        log_extra.update(
-            {
-                "success": False,
+        logger.warning(
+            "normalize.fail",
+            extra={
+                "job_id": job_id,
                 "error": exc.code,
                 "error_message": exc.message,
                 "duration_ms": int((time.monotonic() - started) * 1000),
-            }
+                "success": False,
+            },
         )
-        logger.warning("normalize.fail", extra=log_extra)
         raise
     except Exception:
         shutil.rmtree(work_dir, ignore_errors=True)
         metrics.JOBS_TOTAL.labels(outcome="internal_error").inc()
-        log_extra["duration_ms"] = int((time.monotonic() - started) * 1000)
-        logger.exception("normalize.crash", extra=log_extra)
+        logger.exception("normalize.crash", extra={
+            "job_id": job_id,
+            "duration_ms": int((time.monotonic() - started) * 1000),
+        })
         raise
     finally:
         await file.close()
+
+
+@app.post("/v1/normalize/jobs")
+async def normalize_async(
+    request: Request,
+    file: UploadFile,
+    profile: str | None = None,
+    content_length: int | None = Header(default=None, alias="Content-Length"),
+) -> JSONResponse:
+    settings: Settings = request.app.state.settings
+    if content_length is not None and content_length > settings.max_upload_bytes:
+        raise UploadTooLarge(settings.max_upload_bytes)
+    if profile and profile not in {"web-h264"}:
+        logger.info("unknown_profile", extra={"profile": profile})
+
+    job_id = uuid.uuid4().hex
+    work_dir = Path(tempfile.mkdtemp(prefix="normalize-", dir=settings.temp_dir))
+    job = NormalizeJob(id=job_id, status="queued", work_dir=work_dir)
+    async with request.app.state.jobs_lock:
+        request.app.state.jobs[job_id] = job
+
+    async def run() -> None:
+        started = time.monotonic()
+        try:
+            job.status = "processing"
+
+            async def on_progress(frac: float) -> None:
+                job.progress = max(job.progress, frac)
+
+            output_path, headers = await _run_normalize_job(
+                request=request,
+                file=file,
+                job_id=job_id,
+                work_dir=work_dir,
+                progress_cb=on_progress,
+            )
+            job.progress = 1.0
+            job.status = "done"
+            job.output_path = output_path
+            job.headers = headers
+        except NormalizeError as exc:
+            metrics.JOBS_TOTAL.labels(outcome=exc.code).inc()
+            job.status = "failed"
+            job.message = exc.message
+            logger.warning(
+                "normalize.fail",
+                extra={
+                    "job_id": job_id,
+                    "error": exc.code,
+                    "error_message": exc.message,
+                    "duration_ms": int((time.monotonic() - started) * 1000),
+                    "success": False,
+                },
+            )
+        except Exception:
+            metrics.JOBS_TOTAL.labels(outcome="internal_error").inc()
+            job.status = "failed"
+            job.message = "internal error"
+            logger.exception("normalize.crash", extra={"job_id": job_id})
+        finally:
+            await file.close()
+
+    asyncio.create_task(run())
+    return JSONResponse(
+        status_code=202,
+        content={
+            "jobId": job_id,
+            "statusUrl": f"/v1/normalize/jobs/{job_id}",
+            "resultUrl": f"/v1/normalize/jobs/{job_id}/result",
+        },
+    )
+
+
+@app.get("/v1/normalize/jobs/{job_id}")
+async def normalize_job_status(request: Request, job_id: str) -> JSONResponse:
+    job = request.app.state.jobs.get(job_id)
+    if job is None:
+        return JSONResponse(status_code=404, content={"error": "not_found", "message": "job not found"})
+    return JSONResponse(
+        {
+            "jobId": job.id,
+            "status": job.status,
+            "progress": round(job.progress * 100, 2),
+            "message": job.message,
+        }
+    )
+
+
+@app.get("/v1/normalize/jobs/{job_id}/result")
+async def normalize_job_result(request: Request, job_id: str) -> Response:
+    job = request.app.state.jobs.get(job_id)
+    if job is None:
+        return JSONResponse(status_code=404, content={"error": "not_found", "message": "job not found"})
+    if job.status == "failed":
+        return JSONResponse(status_code=422, content={"error": "decode_failed", "message": job.message or "failed"})
+    if job.status != "done" or job.output_path is None:
+        return JSONResponse(status_code=409, content={"error": "not_ready", "message": "job is still running"})
+
+    async def streamer() -> AsyncIterator[bytes]:
+        try:
+            async for chunk in iter_file(job.output_path):
+                yield chunk
+        finally:
+            if job.work_dir is not None:
+                shutil.rmtree(job.work_dir, ignore_errors=True)
+            request.app.state.jobs.pop(job_id, None)
+
+    return StreamingResponse(streamer(), media_type="video/mp4", headers=job.headers)
 
 
 def main() -> None:

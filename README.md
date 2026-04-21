@@ -31,11 +31,12 @@
 
 | code | HTTP | 의미 |
 |---|---|---|
+| `unsupported_media_type` | 415 | 지원하지 않는 컨테이너/코덱 |
 | `upload_too_large` | 413 | `MAX_UPLOAD_BYTES` 초과 |
 | `invalid_input` | 422 | ffprobe가 입력을 거부 (비디오 아님) |
 | `no_video_stream` | 422 | 비디오 스트림 없음 |
 | `timeout` | 504 | `JOB_TIMEOUT_MS` 초과 |
-| `ffmpeg_failed` | 500 | ffmpeg 비정상 종료 |
+| `ffmpeg_failed` | 422 | ffmpeg 디코딩/인코딩 실패 |
 | `ffprobe_unavailable` | 503 | ffprobe 바이너리가 실행 불가(링커 오류, 미설치) |
 | `ffmpeg_unavailable` | 503 | `/healthz`에서만, ffmpeg 바이너리 실행 불가 |
 
@@ -49,6 +50,14 @@
 ### `GET /metrics`
 
 Prometheus exposition format.
+
+### 디코딩 진행률용 비동기 API
+
+- `POST /v1/normalize/jobs` : 업로드 + 잡 생성 (`202 Accepted`)
+- `GET /v1/normalize/jobs/{jobId}` : `{status, progress}` 폴링
+- `GET /v1/normalize/jobs/{jobId}/result` : 완료 후 MP4 스트리밍 반환
+
+`progress` 는 ffmpeg `-progress pipe:2` 출력(`out_time_ms`) 기반 추정치로, 긴 디코딩 구간을 프런트에서 `decoding` 퍼센트로 표시할 수 있다.
 
 ---
 

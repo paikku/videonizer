@@ -5,7 +5,7 @@ import json
 from dataclasses import dataclass
 from pathlib import Path
 
-from .errors import FfprobeUnavailable, InvalidInput, NoVideoStream
+from .errors import FfprobeUnavailable, InvalidInput, NoVideoStream, UnsupportedMediaType
 
 # Stderr substrings that indicate the ffprobe binary itself cannot run
 # (dynamic linker or loader failure), not a bad input file.
@@ -16,10 +16,21 @@ _INFRA_FAILURE_PATTERNS = (
     "cannot execute binary file",
 )
 
+_UNSUPPORTED_INPUT_PATTERNS = (
+    "invalid data found when processing input",
+    "unknown format",
+    "moov atom not found",
+)
+
 
 def _is_infra_failure(stderr: str) -> bool:
     s = stderr.lower()
     return any(pat in s for pat in _INFRA_FAILURE_PATTERNS)
+
+
+def _is_unsupported_input(stderr: str) -> bool:
+    s = stderr.lower()
+    return any(pat in s for pat in _UNSUPPORTED_INPUT_PATTERNS)
 
 
 @dataclass
@@ -86,6 +97,8 @@ async def ffprobe(path: Path, ffprobe_path: str) -> ProbeResult:
     if proc.returncode != 0:
         if _is_infra_failure(stderr_text):
             raise FfprobeUnavailable(stderr_text)
+        if _is_unsupported_input(stderr_text):
+            raise UnsupportedMediaType(stderr_text[:300] or "unsupported container/codec")
         raise InvalidInput(f"ffprobe failed: {stderr_text[:300]}")
 
     try:

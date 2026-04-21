@@ -1,4 +1,9 @@
-from app.probe import ProbeResult, _extract_rotation, _is_infra_failure
+from app.probe import (
+    ProbeResult,
+    _extract_rotation,
+    _is_infra_failure,
+    _is_unsupported_input,
+)
 
 
 def test_web_compatible_happy_path() -> None:
@@ -62,3 +67,8 @@ def test_infra_failure_not_triggered_for_codec_errors() -> None:
         "Invalid data found when processing input"
     )
     assert not _is_infra_failure("moov atom not found")
+
+
+def test_unsupported_input_detected() -> None:
+    assert _is_unsupported_input("Invalid data found when processing input")
+    assert _is_unsupported_input("moov atom not found")
