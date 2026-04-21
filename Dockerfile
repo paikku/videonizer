@@ -8,7 +8,8 @@ FROM python:3.12-slim AS base
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1 \
-    PIP_DISABLE_PIP_VERSION_CHECK=1
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    UVICORN_RELOAD=0
 
 # Copy ffmpeg binaries + their bundled shared libs into /opt/ffmpeg so they
 # do NOT shadow the base image's system libs (e.g. libssl.so.3 that Python's
@@ -47,4 +48,7 @@ HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
   CMD python -c "import urllib.request,sys; \
 sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/healthz', timeout=3).status==200 else 1)"
 
-CMD ["python", "-m", "app.main"]
+# Dev tip:
+# -v $(pwd)/app:/srv/app -e UVICORN_RELOAD=1
+# 를 사용하면 소스만 바꿔도 이미지 재빌드 없이 컨테이너 내에서 자동 리로드됩니다.
+CMD ["sh", "-c", "if [ \"$UVICORN_RELOAD\" = \"1\" ]; then exec uvicorn app.main:app --host 0.0.0.0 --port ${PORT} --reload --reload-dir /srv/app; else exec python -m app.main; fi"]

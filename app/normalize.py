@@ -6,7 +6,6 @@ import os
 import signal
 import time
 import uuid
-import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import AsyncIterator, Awaitable, Callable
@@ -83,14 +82,14 @@ def build_ffmpeg_cmd(
 ProgressCallback = Callable[[float], Awaitable[None] | None]
 
 
-def _extract_progress_fraction(stderr_text: str, duration_s: float) -> float | None:
-    if duration_s <= 0:
+def _progress_fraction_from_line(line: str, duration_s: float) -> float | None:
+    if duration_s <= 0 or not line.startswith("out_time_ms="):
         return None
-    matches = re.findall(r"out_time_ms=(\d+)", stderr_text)
-    if not matches:
+    raw = line.split("=", 1)[1].strip()
+    if not raw.isdigit():
         return None
-    latest_ms = int(matches[-1])
-    fraction = latest_ms / (duration_s * 1_000_000)
+    out_time_ms = int(raw)
+    fraction = out_time_ms / (duration_s * 1_000_000)
     return max(0.0, min(1.0, fraction))
 
 
@@ -109,8 +108,31 @@ async def _run_ffmpeg(
         stderr=asyncio.subprocess.PIPE,
         start_new_session=True,
     )
+
+    async def wait_with_streamed_progress() -> tuple[int, str]:
+        assert proc.stderr is not None
+        stderr_parts: list[str] = []
+        latest_progress = 0.0
+        while True:
+            line_bytes = await proc.stderr.readline()
+            if not line_bytes:
+                break
+            line = line_bytes.decode(errors="ignore")
+            stderr_parts.append(line)
+            if progress_cb is None:
+                continue
+            frac = _progress_fraction_from_line(line, duration_s)
+            if frac is None or frac <= latest_progress:
+                continue
+            latest_progress = frac
+            maybe = progress_cb(frac)
+            if asyncio.iscoroutine(maybe):
+                await maybe
+        rc = await proc.wait()
+        return rc, "".join(stderr_parts)
+
     try:
-        _, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout_s)
+        rc, stderr_text = await asyncio.wait_for(wait_with_streamed_progress(), timeout=timeout_s)
     except asyncio.TimeoutError:
         logger.warning("ffmpeg.timeout", extra={"pid": proc.pid})
         try:
@@ -122,14 +144,7 @@ async def _run_ffmpeg(
         except asyncio.TimeoutError:
             pass
         raise JobTimeout(timeout_s)
-    stderr_text = (stderr or b"").decode(errors="ignore")
-    if progress_cb is not None:
-        frac = _extract_progress_fraction(stderr_text, duration_s)
-        if frac is not None:
-            maybe = progress_cb(frac)
-            if asyncio.iscoroutine(maybe):
-                await maybe
-    return proc.returncode or 0, stderr_text
+    return rc or 0, stderr_text
 
 
 async def normalize_file(

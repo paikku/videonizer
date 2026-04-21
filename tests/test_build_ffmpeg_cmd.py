@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from app.normalize import build_ffmpeg_cmd
+from app.normalize import _progress_fraction_from_line, build_ffmpeg_cmd
 from app.probe import ProbeResult
 
 
@@ -121,3 +121,12 @@ def test_no_shell_interpolation() -> None:
     )
     # The literal path must appear as a single argv element, unescaped.
     assert str(evil) in cmd
+
+
+def test_progress_fraction_from_line_parses_out_time_ms() -> None:
+    frac = _progress_fraction_from_line("out_time_ms=5000000\n", duration_s=10.0)
+    assert frac == 0.5
+
+
+def test_progress_fraction_from_line_ignores_unrelated_lines() -> None:
+    assert _progress_fraction_from_line("progress=continue\n", duration_s=10.0) is None
