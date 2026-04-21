@@ -7,12 +7,20 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PIP_NO_CACHE_DIR=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1
 
-# ffmpeg/ffprobe binaries and shared libraries
+# ffmpeg/ffprobe binaries
 COPY --from=ffmpeg /usr/local/bin/ffmpeg /usr/local/bin/ffmpeg
 COPY --from=ffmpeg /usr/local/bin/ffprobe /usr/local/bin/ffprobe
-COPY --from=ffmpeg /usr/local/lib/ /usr/local/lib/
 
-# Runtime dependencies (TLS certs + libc++ runtime used by ffmpeg build)
+# Minimal ffmpeg shared libs required by ffmpeg/ffprobe
+COPY --from=ffmpeg /usr/local/lib/libavcodec.so* /usr/local/lib/
+COPY --from=ffmpeg /usr/local/lib/libavdevice.so* /usr/local/lib/
+COPY --from=ffmpeg /usr/local/lib/libavfilter.so* /usr/local/lib/
+COPY --from=ffmpeg /usr/local/lib/libavformat.so* /usr/local/lib/
+COPY --from=ffmpeg /usr/local/lib/libavutil.so* /usr/local/lib/
+COPY --from=ffmpeg /usr/local/lib/libpostproc.so* /usr/local/lib/
+COPY --from=ffmpeg /usr/local/lib/libswresample.so* /usr/local/lib/
+COPY --from=ffmpeg /usr/local/lib/libswscale.so* /usr/local/lib/
+
 RUN apt-get update \
  && apt-get install -y --no-install-recommends ca-certificates libstdc++6 \
  && rm -rf /var/lib/apt/lists/*
