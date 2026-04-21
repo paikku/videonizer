@@ -32,11 +32,14 @@
 | code | HTTP | 의미 |
 |---|---|---|
 | `upload_too_large` | 413 | `MAX_UPLOAD_BYTES` 초과 |
-| `invalid_input` | 422 | ffprobe 실패 (비디오 아님) |
+| `invalid_input` | 422 | ffprobe가 입력을 거부 (비디오 아님) |
 | `no_video_stream` | 422 | 비디오 스트림 없음 |
 | `timeout` | 504 | `JOB_TIMEOUT_MS` 초과 |
 | `ffmpeg_failed` | 500 | ffmpeg 비정상 종료 |
-| `ffmpeg_unavailable` | 503 | `/healthz` 에서만, 바이너리 없음 |
+| `ffprobe_unavailable` | 503 | ffprobe 바이너리가 실행 불가(링커 오류, 미설치) |
+| `ffmpeg_unavailable` | 503 | `/healthz`에서만, ffmpeg 바이너리 실행 불가 |
+
+> `ffprobe_unavailable` 503은 `/v1/normalize` 응답에서도 발생. 클라이언트는 non-2xx를 보고 자동으로 wasm 폴백으로 전환하므로 사용자 입장에서는 투명하게 넘어감.
 
 ### `GET /healthz`
 
@@ -162,12 +165,16 @@ python -m venv .venv
 
 ### Docker
 
+이미지는 2-stage 빌드: `jrottenberg/ffmpeg:7.1-ubuntu`에서 ffmpeg/ffprobe 바이너리와 `/usr/local/lib` 전체를 `/opt/ffmpeg/`로 복사하고, `/usr/local/bin/` 아래에 `LD_LIBRARY_PATH=/opt/ffmpeg/lib`를 설정하는 얇은 래퍼를 둬서 Python이 시스템 libssl을 계속 쓰게 분리함. 빌드 중 `ffmpeg -version`/`ffprobe -version` + `python -c "import ssl"`로 linkage 회귀를 막음.
+
 ```bash
 docker build -t videonizer-normalize .
-docker run --rm -p 8080:8080 \
+docker run --rm -p 8000:8000 \
   -e ALLOWED_ORIGINS=http://localhost:3000 \
   videonizer-normalize
 ```
+
+컨테이너 내부 포트는 `8000` (Dockerfile `ENV PORT=8000`). 로컬 개발(`python -m app.main`)은 코드 기본값 `8080` 사용.
 
 ### 클라이언트 설정
 

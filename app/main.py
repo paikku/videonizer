@@ -34,7 +34,8 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     configure_logging(settings.log_level)
     app.state.settings = settings
     app.state.limiter = JobLimiter(settings.max_concurrent_jobs)
-    app.state.ffmpeg_ok = await _check_ffmpeg(settings)
+    app.state.ffmpeg_ok = await _check_binary(settings.ffmpeg_path)
+    app.state.ffprobe_ok = await _check_binary(settings.ffprobe_path)
     logger.info(
         "startup",
         extra={
@@ -42,6 +43,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             "max_upload_bytes": settings.max_upload_bytes,
             "job_timeout_ms": settings.job_timeout_ms,
             "ffmpeg_ok": app.state.ffmpeg_ok,
+            "ffprobe_ok": app.state.ffprobe_ok,
         },
     )
     yield
@@ -82,17 +84,29 @@ async def normalize_error_handler(_: Request, exc: NormalizeError) -> JSONRespon
 # Helpers ---------------------------------------------------------------------
 
 
-async def _check_ffmpeg(settings: Settings) -> bool:
+async def _check_binary(path: str) -> bool:
+    """Return True when `<path> -version` exits 0 — proves the binary can
+    actually run (not just that the file exists on disk).
+
+    Catches shared-library linkage failures like `libavdevice.so.61: cannot
+    open shared object file` at startup, before we accept any upload.
+    """
     try:
         proc = await asyncio.create_subprocess_exec(
-            settings.ffmpeg_path, "-version",
+            path, "-version",
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
-        await proc.communicate()
-        return proc.returncode == 0
     except FileNotFoundError:
         return False
+    _, stderr = await proc.communicate()
+    if proc.returncode != 0:
+        logger.error(
+            "binary.check_failed",
+            extra={"binary": path, "stderr": stderr.decode(errors='ignore')[:300]},
+        )
+        return False
+    return True
 
 
 async def _stream_to_disk(upload: UploadFile, dest: Path, limit: int) -> int:
@@ -115,11 +129,17 @@ async def _stream_to_disk(upload: UploadFile, dest: Path, limit: int) -> int:
 
 @app.get("/healthz")
 async def healthz(request: Request) -> Response:
-    ok = getattr(request.app.state, "ffmpeg_ok", False)
-    if not ok:
+    ffmpeg_ok = getattr(request.app.state, "ffmpeg_ok", False)
+    ffprobe_ok = getattr(request.app.state, "ffprobe_ok", False)
+    if not ffmpeg_ok:
         return JSONResponse(
             status_code=503,
-            content={"error": "ffmpeg_unavailable", "message": "ffmpeg binary not found"},
+            content={"error": "ffmpeg_unavailable", "message": "ffmpeg binary cannot execute"},
+        )
+    if not ffprobe_ok:
+        return JSONResponse(
+            status_code=503,
+            content={"error": "ffprobe_unavailable", "message": "ffprobe binary cannot execute"},
         )
     return JSONResponse({"status": "ok"})
 

@@ -46,3 +46,17 @@ class FfmpegFailed(NormalizeError):
             f"ffmpeg failed: {stderr[:500]}",
             500,
         )
+
+
+class FfprobeUnavailable(NormalizeError):
+    """The ffprobe binary itself cannot execute (missing libs, not found, etc.).
+
+    Not the user's fault — map to 503 so clients fall back to the wasm path.
+    """
+
+    def __init__(self, detail: str) -> None:
+        super().__init__(
+            "ffprobe_unavailable",
+            f"ffprobe cannot execute: {detail[:300]}",
+            503,
+        )
