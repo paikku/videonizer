@@ -5,7 +5,21 @@ import json
 from dataclasses import dataclass
 from pathlib import Path
 
-from .errors import InvalidInput, NoVideoStream
+from .errors import FfprobeUnavailable, InvalidInput, NoVideoStream
+
+# Stderr substrings that indicate the ffprobe binary itself cannot run
+# (dynamic linker or loader failure), not a bad input file.
+_INFRA_FAILURE_PATTERNS = (
+    "error while loading shared libraries",
+    "cannot open shared object file",
+    "symbol lookup error",
+    "cannot execute binary file",
+)
+
+
+def _is_infra_failure(stderr: str) -> bool:
+    s = stderr.lower()
+    return any(pat in s for pat in _INFRA_FAILURE_PATTERNS)
 
 
 @dataclass
@@ -53,21 +67,26 @@ def _extract_rotation(video_stream: dict) -> int:
 
 
 async def ffprobe(path: Path, ffprobe_path: str) -> ProbeResult:
-    proc = await asyncio.create_subprocess_exec(
-        ffprobe_path,
-        "-v", "error",
-        "-show_format",
-        "-show_streams",
-        "-of", "json",
-        str(path),
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-    )
-    stdout, stderr = await proc.communicate()
-    if proc.returncode != 0:
-        raise InvalidInput(
-            f"ffprobe failed: {stderr.decode(errors='ignore').strip()[:300]}"
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            ffprobe_path,
+            "-v", "error",
+            "-show_format",
+            "-show_streams",
+            "-of", "json",
+            str(path),
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
         )
+    except FileNotFoundError as exc:
+        raise FfprobeUnavailable(f"binary not found: {ffprobe_path}") from exc
+
+    stdout, stderr = await proc.communicate()
+    stderr_text = stderr.decode(errors="ignore").strip()
+    if proc.returncode != 0:
+        if _is_infra_failure(stderr_text):
+            raise FfprobeUnavailable(stderr_text)
+        raise InvalidInput(f"ffprobe failed: {stderr_text[:300]}")
 
     try:
         data = json.loads(stdout or b"{}")

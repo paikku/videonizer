@@ -13,7 +13,7 @@ from fastapi.testclient import TestClient
 
 from app import normalize as normalize_mod
 from app.config import get_settings
-from app.errors import InvalidInput, NoVideoStream
+from app.errors import FfprobeUnavailable, InvalidInput, NoVideoStream
 from app.main import app
 from app.probe import ProbeResult
 
@@ -24,6 +24,7 @@ def client() -> TestClient:
     get_settings.cache_clear()
     with TestClient(app) as c:
         c.app.state.ffmpeg_ok = True
+        c.app.state.ffprobe_ok = True
         yield c
     get_settings.cache_clear()
 
@@ -39,6 +40,13 @@ def test_healthz_fail_when_ffmpeg_missing(client: TestClient) -> None:
     r = client.get("/healthz")
     assert r.status_code == 503
     assert r.json()["error"] == "ffmpeg_unavailable"
+
+
+def test_healthz_fail_when_ffprobe_missing(client: TestClient) -> None:
+    client.app.state.ffprobe_ok = False
+    r = client.get("/healthz")
+    assert r.status_code == 503
+    assert r.json()["error"] == "ffprobe_unavailable"
 
 
 def test_metrics_endpoint(client: TestClient) -> None:
@@ -114,6 +122,27 @@ def test_normalize_invalid_input_returns_422(
 
     assert r.status_code == 422
     assert r.json()["error"] == "invalid_input"
+
+
+def test_normalize_ffprobe_infra_failure_returns_503(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Broken ffprobe binary (e.g. missing libavdevice.so.61) must surface as
+    503 so the client's wasm fallback kicks in — not 422 (which would have the
+    client blame the user's file)."""
+
+    async def fake_ffprobe(path, ffprobe_path):
+        raise FfprobeUnavailable(
+            "ffprobe: error while loading shared libraries: libavdevice.so.61"
+        )
+
+    monkeypatch.setattr(normalize_mod, "ffprobe", fake_ffprobe)
+
+    files = {"file": ("clip.mkv", b"MKVFAKE", "video/x-matroska")}
+    r = client.post("/v1/normalize", files=files)
+
+    assert r.status_code == 503
+    assert r.json()["error"] == "ffprobe_unavailable"
 
 
 def test_upload_size_limit_enforced_during_stream(

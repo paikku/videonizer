@@ -1,4 +1,7 @@
-FROM python:3.12-slim AS base
+# Pinned to bookworm so apt installs a coherent ffmpeg/ffprobe + libs combo.
+# Trixie ships ffmpeg 7.x (libavdevice.so.61); partial upgrades broke our
+# linkage once — pin + runtime verification below prevents a repeat.
+FROM python:3.12-slim-bookworm AS base
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
@@ -7,7 +10,9 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 RUN apt-get update \
  && apt-get install -y --no-install-recommends ffmpeg ca-certificates \
- && rm -rf /var/lib/apt/lists/*
+ && rm -rf /var/lib/apt/lists/* \
+ && ffmpeg -version >/dev/null \
+ && ffprobe -version >/dev/null
 
 WORKDIR /srv
 

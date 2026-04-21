@@ -1,4 +1,4 @@
-from app.probe import ProbeResult, _extract_rotation
+from app.probe import ProbeResult, _extract_rotation, _is_infra_failure
 
 
 def test_web_compatible_happy_path() -> None:
@@ -47,3 +47,18 @@ def test_rotation_from_display_matrix() -> None:
 
 def test_rotation_absent() -> None:
     assert _extract_rotation({}) == 0
+
+
+def test_infra_failure_detected_for_missing_shared_lib() -> None:
+    stderr = (
+        "ffprobe: error while loading shared libraries: libavdevice.so.61: "
+        "cannot open shared object file: No such file or directory"
+    )
+    assert _is_infra_failure(stderr)
+
+
+def test_infra_failure_not_triggered_for_codec_errors() -> None:
+    assert not _is_infra_failure(
+        "Invalid data found when processing input"
+    )
+    assert not _is_infra_failure("moov atom not found")

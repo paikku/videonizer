@@ -32,11 +32,14 @@
 | code | HTTP | 의미 |
 |---|---|---|
 | `upload_too_large` | 413 | `MAX_UPLOAD_BYTES` 초과 |
-| `invalid_input` | 422 | ffprobe 실패 (비디오 아님) |
+| `invalid_input` | 422 | ffprobe가 입력을 거부 (비디오 아님) |
 | `no_video_stream` | 422 | 비디오 스트림 없음 |
 | `timeout` | 504 | `JOB_TIMEOUT_MS` 초과 |
 | `ffmpeg_failed` | 500 | ffmpeg 비정상 종료 |
-| `ffmpeg_unavailable` | 503 | `/healthz` 에서만, 바이너리 없음 |
+| `ffprobe_unavailable` | 503 | ffprobe 바이너리가 실행 불가(링커 오류, 미설치) |
+| `ffmpeg_unavailable` | 503 | `/healthz`에서만, ffmpeg 바이너리 실행 불가 |
+
+> `ffprobe_unavailable` 503은 `/v1/normalize` 응답에서도 발생. 클라이언트는 non-2xx를 보고 자동으로 wasm 폴백으로 전환하므로 사용자 입장에서는 투명하게 넘어감.
 
 ### `GET /healthz`
 
