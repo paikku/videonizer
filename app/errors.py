@@ -25,6 +25,11 @@ class InvalidInput(NormalizeError):
         super().__init__("invalid_input", message, 422)
 
 
+class UnsupportedMediaType(NormalizeError):
+    def __init__(self, message: str) -> None:
+        super().__init__("unsupported_media_type", message, 415)
+
+
 class NoVideoStream(NormalizeError):
     def __init__(self) -> None:
         super().__init__("no_video_stream", "input has no video stream", 422)
@@ -44,7 +49,7 @@ class FfmpegFailed(NormalizeError):
         super().__init__(
             "ffmpeg_failed",
             f"ffmpeg failed: {stderr[:500]}",
-            500,
+            422,
         )
 
 
