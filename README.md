@@ -165,12 +165,16 @@ python -m venv .venv
 
 ### Docker
 
+이미지는 2-stage 빌드: `jrottenberg/ffmpeg:7.1-ubuntu`에서 ffmpeg/ffprobe 바이너리와 `/usr/local/lib` 전체를 `/opt/ffmpeg/`로 복사하고, `/usr/local/bin/` 아래에 `LD_LIBRARY_PATH=/opt/ffmpeg/lib`를 설정하는 얇은 래퍼를 둬서 Python이 시스템 libssl을 계속 쓰게 분리함. 빌드 중 `ffmpeg -version`/`ffprobe -version` + `python -c "import ssl"`로 linkage 회귀를 막음.
+
 ```bash
 docker build -t videonizer-normalize .
-docker run --rm -p 8080:8080 \
+docker run --rm -p 8000:8000 \
   -e ALLOWED_ORIGINS=http://localhost:3000 \
   videonizer-normalize
 ```
+
+컨테이너 내부 포트는 `8000` (Dockerfile `ENV PORT=8000`). 로컬 개발(`python -m app.main`)은 코드 기본값 `8080` 사용.
 
 ### 클라이언트 설정
 
