@@ -193,6 +193,68 @@ async def _run_normalize_job(
     return outcome.output_path, headers
 
 
+def _job_urls(request: Request, job_id: str) -> tuple[str, str]:
+    return str(request.url_for("normalize_job_status", job_id=job_id)), str(
+        request.url_for("normalize_job_result", job_id=job_id)
+    )
+
+
+async def _start_async_job(
+    *,
+    request: Request,
+    file: UploadFile,
+    job_id: str,
+    work_dir: Path,
+) -> NormalizeJob:
+    job = NormalizeJob(id=job_id, status="queued", work_dir=work_dir)
+    async with request.app.state.jobs_lock:
+        request.app.state.jobs[job_id] = job
+
+    async def run() -> None:
+        started = time.monotonic()
+        try:
+            job.status = "processing"
+
+            async def on_progress(frac: float) -> None:
+                job.progress = max(job.progress, frac)
+
+            output_path, headers = await _run_normalize_job(
+                request=request,
+                file=file,
+                job_id=job_id,
+                work_dir=work_dir,
+                progress_cb=on_progress,
+            )
+            job.progress = 1.0
+            job.status = "done"
+            job.output_path = output_path
+            job.headers = headers
+        except NormalizeError as exc:
+            metrics.JOBS_TOTAL.labels(outcome=exc.code).inc()
+            job.status = "failed"
+            job.message = exc.message
+            logger.warning(
+                "normalize.fail",
+                extra={
+                    "job_id": job_id,
+                    "error": exc.code,
+                    "error_message": exc.message,
+                    "duration_ms": int((time.monotonic() - started) * 1000),
+                    "success": False,
+                },
+            )
+        except Exception:
+            metrics.JOBS_TOTAL.labels(outcome="internal_error").inc()
+            job.status = "failed"
+            job.message = "internal error"
+            logger.exception("normalize.crash", extra={"job_id": job_id})
+        finally:
+            await file.close()
+
+    asyncio.create_task(run())
+    return job
+
+
 # Routes ----------------------------------------------------------------------
 
 
@@ -224,6 +286,7 @@ async def normalize(
     request: Request,
     file: UploadFile,
     profile: str | None = None,
+    async_job: bool = False,
     content_length: int | None = Header(default=None, alias="Content-Length"),
 ) -> Response:
     settings: Settings = request.app.state.settings
@@ -241,6 +304,23 @@ async def normalize(
     started = time.monotonic()
 
     try:
+        if async_job:
+            await _start_async_job(
+                request=request,
+                file=file,
+                job_id=job_id,
+                work_dir=work_dir,
+            )
+            status_url, result_url = _job_urls(request, job_id)
+            return JSONResponse(
+                status_code=202,
+                content={
+                    "jobId": job_id,
+                    "statusUrl": status_url,
+                    "resultUrl": result_url,
+                },
+            )
+
         output_path, headers = await _run_normalize_job(
             request=request,
             file=file,
@@ -303,59 +383,16 @@ async def normalize_async(
 
     job_id = uuid.uuid4().hex
     work_dir = Path(tempfile.mkdtemp(prefix="normalize-", dir=settings.temp_dir))
-    job = NormalizeJob(id=job_id, status="queued", work_dir=work_dir)
-    async with request.app.state.jobs_lock:
-        request.app.state.jobs[job_id] = job
-
-    async def run() -> None:
-        started = time.monotonic()
-        try:
-            job.status = "processing"
-
-            async def on_progress(frac: float) -> None:
-                job.progress = max(job.progress, frac)
-
-            output_path, headers = await _run_normalize_job(
-                request=request,
-                file=file,
-                job_id=job_id,
-                work_dir=work_dir,
-                progress_cb=on_progress,
-            )
-            job.progress = 1.0
-            job.status = "done"
-            job.output_path = output_path
-            job.headers = headers
-        except NormalizeError as exc:
-            metrics.JOBS_TOTAL.labels(outcome=exc.code).inc()
-            job.status = "failed"
-            job.message = exc.message
-            logger.warning(
-                "normalize.fail",
-                extra={
-                    "job_id": job_id,
-                    "error": exc.code,
-                    "error_message": exc.message,
-                    "duration_ms": int((time.monotonic() - started) * 1000),
-                    "success": False,
-                },
-            )
-        except Exception:
-            metrics.JOBS_TOTAL.labels(outcome="internal_error").inc()
-            job.status = "failed"
-            job.message = "internal error"
-            logger.exception("normalize.crash", extra={"job_id": job_id})
-        finally:
-            await file.close()
-
-    asyncio.create_task(run())
+    await _start_async_job(
+        request=request,
+        file=file,
+        job_id=job_id,
+        work_dir=work_dir,
+    )
+    status_url, result_url = _job_urls(request, job_id)
     return JSONResponse(
         status_code=202,
-        content={
-            "jobId": job_id,
-            "statusUrl": f"/v1/normalize/jobs/{job_id}",
-            "resultUrl": f"/v1/normalize/jobs/{job_id}/result",
-        },
+        content={"jobId": job_id, "statusUrl": status_url, "resultUrl": result_url},
     )
 
 
@@ -368,6 +405,7 @@ async def normalize_job_status(request: Request, job_id: str) -> JSONResponse:
         {
             "jobId": job.id,
             "status": job.status,
+            "state": job.status,
             "progress": round(job.progress * 100, 2),
             "message": job.message,
         }

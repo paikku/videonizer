@@ -188,3 +188,71 @@ def test_remux_flag_header_when_already_compatible(
 
     assert r.status_code == 200
     assert r.headers["x-normalize-remuxed"] == "1"
+
+
+def test_normalize_async_mode_returns_job_payload(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    async def fake_ffprobe(path, ffprobe_path):
+        await asyncio.sleep(0.01)
+        return ProbeResult(
+            format_name="avi",
+            duration=3.0,
+            has_video=True,
+            has_audio=True,
+            video_codec="mpeg4",
+            audio_codec="mp3",
+            width=640,
+            height=480,
+            rotation=0,
+        )
+
+    async def fake_run_ffmpeg(cmd, timeout_s):
+        Path(cmd[-1]).write_bytes(b"FAKE-MP4-BYTES")
+        return 0, ""
+
+    monkeypatch.setattr(normalize_mod, "ffprobe", fake_ffprobe)
+    monkeypatch.setattr(normalize_mod, "_run_ffmpeg", fake_run_ffmpeg)
+
+    files = {"file": ("clip.avi", b"RIFFFAKEAVI", "video/x-msvideo")}
+    r = client.post("/v1/normalize?async_job=true", files=files)
+    assert r.status_code == 202
+    body = r.json()
+    assert body["jobId"]
+    assert body["statusUrl"].endswith(f"/v1/normalize/jobs/{body['jobId']}")
+    assert body["resultUrl"].endswith(f"/v1/normalize/jobs/{body['jobId']}/result")
+
+
+def test_job_status_includes_state_alias(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    async def fake_ffprobe(path, ffprobe_path):
+        await asyncio.sleep(0.01)
+        return ProbeResult(
+            format_name="avi",
+            duration=3.0,
+            has_video=True,
+            has_audio=True,
+            video_codec="mpeg4",
+            audio_codec="mp3",
+            width=640,
+            height=480,
+            rotation=0,
+        )
+
+    async def fake_run_ffmpeg(cmd, timeout_s):
+        Path(cmd[-1]).write_bytes(b"FAKE-MP4-BYTES")
+        return 0, ""
+
+    monkeypatch.setattr(normalize_mod, "ffprobe", fake_ffprobe)
+    monkeypatch.setattr(normalize_mod, "_run_ffmpeg", fake_run_ffmpeg)
+
+    files = {"file": ("clip.avi", b"RIFFFAKEAVI", "video/x-msvideo")}
+    created = client.post("/v1/normalize/jobs", files=files)
+    assert created.status_code == 202
+    status_url = created.json()["statusUrl"]
+
+    polled = client.get(status_url)
+    assert polled.status_code == 200
+    payload = polled.json()
+    assert payload["state"] == payload["status"]
