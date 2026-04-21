@@ -150,9 +150,30 @@ async def _run_normalize_job(
     settings: Settings = request.app.state.settings
     limiter: JobLimiter = request.app.state.limiter
     input_path = work_dir / f"{job_id}.in"
+    input_bytes = await _stream_to_disk(file, input_path, settings.max_upload_bytes)
+    return await _run_normalize_from_path(
+        request=request,
+        job_id=job_id,
+        work_dir=work_dir,
+        input_path=input_path,
+        input_bytes=input_bytes,
+        progress_cb=progress_cb,
+    )
+
+
+async def _run_normalize_from_path(
+    *,
+    request: Request,
+    job_id: str,
+    work_dir: Path,
+    input_path: Path,
+    input_bytes: int,
+    progress_cb=None,
+) -> tuple[Path, dict[str, str]]:
+    settings: Settings = request.app.state.settings
+    limiter: JobLimiter = request.app.state.limiter
     log_extra: dict[str, object] = {"job_id": job_id}
 
-    input_bytes = await _stream_to_disk(file, input_path, settings.max_upload_bytes)
     log_extra["input_bytes"] = input_bytes
     metrics.INPUT_BYTES.observe(input_bytes)
 
@@ -202,9 +223,10 @@ def _job_urls(request: Request, job_id: str) -> tuple[str, str]:
 async def _start_async_job(
     *,
     request: Request,
-    file: UploadFile,
     job_id: str,
     work_dir: Path,
+    input_path: Path,
+    input_bytes: int,
 ) -> NormalizeJob:
     job = NormalizeJob(id=job_id, status="queued", work_dir=work_dir)
     async with request.app.state.jobs_lock:
@@ -218,11 +240,12 @@ async def _start_async_job(
             async def on_progress(frac: float) -> None:
                 job.progress = max(job.progress, frac)
 
-            output_path, headers = await _run_normalize_job(
+            output_path, headers = await _run_normalize_from_path(
                 request=request,
-                file=file,
                 job_id=job_id,
                 work_dir=work_dir,
+                input_path=input_path,
+                input_bytes=input_bytes,
                 progress_cb=on_progress,
             )
             job.progress = 1.0
@@ -248,11 +271,30 @@ async def _start_async_job(
             job.status = "failed"
             job.message = "internal error"
             logger.exception("normalize.crash", extra={"job_id": job_id})
-        finally:
-            await file.close()
-
     asyncio.create_task(run())
     return job
+
+
+async def _enqueue_async_upload(
+    *,
+    request: Request,
+    file: UploadFile,
+    job_id: str,
+    work_dir: Path,
+) -> None:
+    settings: Settings = request.app.state.settings
+    input_path = work_dir / f"{job_id}.in"
+    try:
+        input_bytes = await _stream_to_disk(file, input_path, settings.max_upload_bytes)
+    finally:
+        await file.close()
+    await _start_async_job(
+        request=request,
+        job_id=job_id,
+        work_dir=work_dir,
+        input_path=input_path,
+        input_bytes=input_bytes,
+    )
 
 
 # Routes ----------------------------------------------------------------------
@@ -305,7 +347,7 @@ async def normalize(
 
     try:
         if async_job:
-            await _start_async_job(
+            await _enqueue_async_upload(
                 request=request,
                 file=file,
                 job_id=job_id,
@@ -365,7 +407,8 @@ async def normalize(
         })
         raise
     finally:
-        await file.close()
+        if not async_job:
+            await file.close()
 
 
 @app.post("/v1/normalize/jobs")
@@ -383,7 +426,7 @@ async def normalize_async(
 
     job_id = uuid.uuid4().hex
     work_dir = Path(tempfile.mkdtemp(prefix="normalize-", dir=settings.temp_dir))
-    await _start_async_job(
+    await _enqueue_async_upload(
         request=request,
         file=file,
         job_id=job_id,
