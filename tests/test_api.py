@@ -75,7 +75,7 @@ def test_normalize_success_path(
     async def fake_ffprobe(path, ffprobe_path):
         return fake_probe
 
-    async def fake_run_ffmpeg(cmd, timeout_s):
+    async def fake_run_ffmpeg(cmd, timeout_s, *, progress_cb=None, duration_s=0.0):
         # Emulate ffmpeg: write a small file to the output path (last argv).
         Path(cmd[-1]).write_bytes(b"FAKE-MP4-BYTES")
         return 0, ""
@@ -177,7 +177,7 @@ def test_remux_flag_header_when_already_compatible(
     async def fake_ffprobe(path, ffprobe_path):
         return fake_probe
 
-    async def fake_run_ffmpeg(cmd, timeout_s):
+    async def fake_run_ffmpeg(cmd, timeout_s, *, progress_cb=None, duration_s=0.0):
         Path(cmd[-1]).write_bytes(b"remuxed")
         return 0, ""
 
@@ -208,7 +208,7 @@ def test_normalize_async_mode_returns_job_payload(
             rotation=0,
         )
 
-    async def fake_run_ffmpeg(cmd, timeout_s):
+    async def fake_run_ffmpeg(cmd, timeout_s, *, progress_cb=None, duration_s=0.0):
         Path(cmd[-1]).write_bytes(b"FAKE-MP4-BYTES")
         return 0, ""
 
@@ -241,7 +241,7 @@ def test_job_status_includes_state_alias(
             rotation=0,
         )
 
-    async def fake_run_ffmpeg(cmd, timeout_s):
+    async def fake_run_ffmpeg(cmd, timeout_s, *, progress_cb=None, duration_s=0.0):
         Path(cmd[-1]).write_bytes(b"FAKE-MP4-BYTES")
         return 0, ""
 
@@ -276,7 +276,7 @@ def test_async_job_streams_upload_before_background_task(
             rotation=0,
         )
 
-    async def fake_run_ffmpeg(cmd, timeout_s):
+    async def fake_run_ffmpeg(cmd, timeout_s, *, progress_cb=None, duration_s=0.0):
         Path(cmd[-1]).write_bytes(b"FAKE-MP4-BYTES")
         return 0, ""
 

@@ -1,14 +1,22 @@
 from __future__ import annotations
 
 
-class NormalizeError(Exception):
-    """Structured error carrying an error code, a human message, and an HTTP status."""
+class ServiceError(Exception):
+    """Base for all structured API errors. Carries error code, human message, HTTP status."""
 
     def __init__(self, code: str, message: str, status: int) -> None:
         super().__init__(message)
         self.code = code
         self.message = message
         self.status = status
+
+
+class NormalizeError(ServiceError):
+    """Errors raised by the /v1/normalize pipeline."""
+
+
+class SegmentError(ServiceError):
+    """Errors raised by the /v1/segment pipeline."""
 
 
 class UploadTooLarge(NormalizeError):
@@ -65,3 +73,39 @@ class FfprobeUnavailable(NormalizeError):
             f"ffprobe cannot execute: {detail[:300]}",
             503,
         )
+
+
+# --- Segment errors ---------------------------------------------------------
+
+
+class SegmentUnsupportedModel(SegmentError):
+    def __init__(self, model: str) -> None:
+        # Message text matches the contract in the requirements doc.
+        super().__init__("unsupported model", f"unsupported model: {model}", 400)
+
+
+class SegmentInvalidRegion(SegmentError):
+    def __init__(self, message: str) -> None:
+        super().__init__("invalid_region", message, 400)
+
+
+class SegmentImageDecodeFailed(SegmentError):
+    def __init__(self, message: str) -> None:
+        super().__init__("image_decode_failed", message, 400)
+
+
+class SegmentUnsupportedImage(SegmentError):
+    def __init__(self, message: str) -> None:
+        super().__init__("unsupported_media_type", message, 415)
+
+
+class SegmentBackendUnavailable(SegmentError):
+    """A model backend can't load (missing weights, missing dep, OOM)."""
+
+    def __init__(self, message: str) -> None:
+        super().__init__("backend_unavailable", message, 503)
+
+
+class SegmentBusy(SegmentError):
+    def __init__(self, message: str = "all segment workers busy") -> None:
+        super().__init__("busy", message, 503)

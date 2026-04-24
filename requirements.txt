@@ -4,3 +4,20 @@ python-multipart==0.0.20
 pydantic==2.10.4
 pydantic-settings==2.7.0
 prometheus-client==0.21.1
+
+# --- Segmentation (CPU-only) -------------------------------------------------
+numpy==1.26.4
+pillow==11.0.0
+opencv-python-headless==4.10.0.84
+
+# torch is pulled transitively by ultralytics. The default PyPI wheel is the
+# CUDA build (~2GB on disk); for a slim CPU-only image, use the cpu wheel
+# index on non-airgapped builds:
+#   pip install --index-url https://download.pytorch.org/whl/cpu \
+#       torch==2.5.1 torchvision==0.20.1
+torch==2.5.1
+torchvision==0.20.1
+
+# FastSAM backend. 8.3.45/.46 were yanked upstream — 8.3.44 is the nearest
+# stable pin that is consistently available from internal mirrors.
+ultralytics==8.3.44

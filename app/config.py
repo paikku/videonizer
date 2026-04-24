@@ -25,6 +25,24 @@ class Settings(BaseSettings):
     temp_dir: str | None = None
     log_level: str = "INFO"
 
+    # --- Segmentation (/v1/segment) -----------------------------------------
+    # CPU-only inference → keep concurrency tight to bound RAM/CPU.
+    segment_max_concurrent: int = 2
+    # Per-request wall-clock budget. SAM/Mask R-CNN on CPU can take a few
+    # seconds; cap so a runaway request doesn't pile up.
+    segment_timeout_ms: int = 30_000
+    # Cap upload size for /v1/segment (single frame, much smaller than video).
+    segment_max_upload_bytes: int = 16 * 1024 * 1024
+    # Crop padding around the prompt bbox before inference (fraction of bbox).
+    segment_crop_padding: float = 0.20
+    # Douglas-Peucker tolerance in normalized coords.
+    segment_polygon_epsilon: float = 0.002
+    # Where on disk to look for pre-downloaded model weights. Empty = let the
+    # backend resolve through its own default cache.
+    segment_weights_dir: str = ""
+    # Eagerly load these backends at startup (comma-separated public model ids).
+    segment_preload_models: str = ""
+
     @property
     def allowed_origins_list(self) -> list[str]:
         return [o.strip() for o in self.allowed_origins.split(",") if o.strip()]
@@ -36,6 +54,18 @@ class Settings(BaseSettings):
     @property
     def ffmpeg_extra_args_list(self) -> list[str]:
         return shlex.split(self.ffmpeg_extra_args) if self.ffmpeg_extra_args else []
+
+    @property
+    def segment_timeout_s(self) -> float:
+        return self.segment_timeout_ms / 1000.0
+
+    @property
+    def segment_preload_models_list(self) -> list[str]:
+        return [
+            m.strip()
+            for m in self.segment_preload_models.split(",")
+            if m.strip()
+        ]
 
 
 @lru_cache(maxsize=1)
