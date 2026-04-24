@@ -198,9 +198,7 @@ python -m venv .venv
 
 ```bash
 docker build -t videonizer-normalize .
-docker run --rm -p 8000:8000 \
-  -e ALLOWED_ORIGINS=http://localhost:3000 \
-  videonizer-normalize
+docker run --rm   -p 0.0.0.0:8000:8000   -e ALLOWED_ORIGINS=http://12.54.79.86:3000   -e UVICORN_RELOAD=1   -v "$(pwd)/app:/srv/app"   videonizer-normalize   python -m uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
 ```
 
 컨테이너 내부 포트는 `8000` (Dockerfile `ENV PORT=8000`). 로컬 개발(`python -m app.main`)은 코드 기본값 `8080` 사용.
