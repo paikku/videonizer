@@ -219,7 +219,7 @@ docker run --rm -p 8000:8000 \
 
 ```bash
 # .env.local (Next.js)
-NEXT_PUBLIC_VIDEO_NORMALIZE_ENDPOINT=http://localhost:8080/v1/normalize
+NEXT_PUBLIC_VIDEO_NORMALIZE_ENDPOINT=http://localhost:8080/v1/normalize?async_job=true
 ```
 
 ---
