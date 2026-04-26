@@ -32,10 +32,53 @@ RUN rm -f /opt/ffmpeg/lib/libc.so* /opt/ffmpeg/lib/libm.so* /opt/ffmpeg/lib/libg
 
 WORKDIR /srv
 
+# --- pip index --------------------------------------------------------------
+# Build-time ARGs so airgapped builds can redirect pip at an internal mirror.
+# Empty defaults = fall back to public PyPI. All three are picked up via pip's
+# well-known env vars — no Dockerfile conditionals.
+#
+# Example (substitute your own index URLs):
+#   docker build \
+#     --build-arg PIP_INDEX_URL=<your-index-url> \
+#     --build-arg PIP_EXTRA_INDEX_URL=<your-extra-index-url> \
+#     --build-arg PIP_TRUSTED_HOST=<your-host> \
+#     -t videonizer .
+ARG PIP_INDEX_URL=
+ARG PIP_EXTRA_INDEX_URL=
+ARG PIP_TRUSTED_HOST=
+ENV PIP_INDEX_URL=${PIP_INDEX_URL} \
+    PIP_EXTRA_INDEX_URL=${PIP_EXTRA_INDEX_URL} \
+    PIP_TRUSTED_HOST=${PIP_TRUSTED_HOST}
+
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+# ultralytics pulls `opencv-python` (non-headless) as a transitive dep. The
+# non-headless wheel dynamically loads libGL.so.1, which is NOT present in
+# python:3.12-slim → runtime crash on first FastSAM inference. Uninstall it
+# and force-reinstall the headless variant so `import cv2` doesn't touch
+# libGL. Keep the `|| true` in case the non-headless wheel didn't land
+# (future ultralytics versions may switch to headless).
+RUN pip install --no-cache-dir -r requirements.txt \
+ && (pip uninstall -y opencv-python opencv-contrib-python || true) \
+ && pip install --no-cache-dir --force-reinstall --no-deps opencv-python-headless==4.10.0.84
 
 COPY app ./app
+
+# --- Segmentation model weights --------------------------------------------
+# All five public model ids back onto a weight file committed under ./weights/.
+# Files larger than GitHub's 100MB limit are committed as split chunks
+# (`<name>.pt.part_00`, `<name>.pt.part_01`, ...) and reassembled here so
+# the running container only ever sees the original .pt file.
+COPY weights/ /opt/segment-weights/
+RUN cd /opt/segment-weights \
+ && for first in *.part_00; do \
+      [ -f "$first" ] || continue ; \
+      out="${first%.part_00}" ; \
+      cat "${out}".part_* > "${out}" ; \
+      rm "${out}".part_* ; \
+      echo "reassembled ${out}: $(stat -c '%s' ${out}) bytes" ; \
+    done
+ENV SEGMENT_WEIGHTS_DIR=/opt/segment-weights \
+    YOLO_CONFIG_DIR=/tmp/ultralytics
 
 RUN groupadd --system app && useradd --system --gid app --home /srv app \
  && chown -R app:app /srv

@@ -12,17 +12,28 @@ from pathlib import Path
 from dataclasses import dataclass, field
 from typing import AsyncIterator, Literal
 
-from fastapi import FastAPI, Header, Request, UploadFile
+from fastapi import FastAPI, Form, Header, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 
 from . import metrics
 from .config import Settings, get_settings
-from .errors import NormalizeError, UploadTooLarge
+from .errors import (
+    NormalizeError,
+    SegmentError,
+    ServiceError,
+    UploadTooLarge,
+)
 from .jobs import JobLimiter
 from .logging_conf import configure_logging
 from .normalize import iter_file, normalize_file
+from .segment import (
+    DEFAULT_MODEL as SEGMENT_DEFAULT_MODEL,
+    SUPPORTED_MODELS as SEGMENT_SUPPORTED_MODELS,
+    segment_image,
+)
+from .segment.registry import configure_weights_dir, resolve_backend
 
 logger = logging.getLogger("videonizer.api")
 
@@ -47,10 +58,30 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     configure_logging(settings.log_level)
     app.state.settings = settings
     app.state.limiter = JobLimiter(settings.max_concurrent_jobs)
+    app.state.segment_limiter = JobLimiter(settings.segment_max_concurrent)
     app.state.jobs: dict[str, NormalizeJob] = {}
     app.state.jobs_lock = asyncio.Lock()
     app.state.ffmpeg_ok = await _check_binary(settings.ffmpeg_path)
     app.state.ffprobe_ok = await _check_binary(settings.ffprobe_path)
+
+    # Wire the segmentation registry to the configured weights dir (if any),
+    # then optionally pre-warm requested backends so the first request doesn't
+    # eat the load latency.
+    configure_weights_dir(settings.segment_weights_dir or None)
+    for model_id in settings.segment_preload_models_list:
+        if model_id not in SEGMENT_SUPPORTED_MODELS:
+            logger.warning("segment.preload.unknown_model", extra={"model": model_id})
+            continue
+        try:
+            resolved = resolve_backend(model_id)
+            ok = await asyncio.to_thread(resolved.backend.is_available)
+            logger.info(
+                "segment.preload",
+                extra={"model": model_id, "backend": resolved.backend_id, "ok": ok},
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception("segment.preload.failed", extra={"model": model_id})
+
     logger.info(
         "startup",
         extra={
@@ -59,6 +90,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             "job_timeout_ms": settings.job_timeout_ms,
             "ffmpeg_ok": app.state.ffmpeg_ok,
             "ffprobe_ok": app.state.ffprobe_ok,
+            "segment_max_concurrent": settings.segment_max_concurrent,
         },
     )
     yield
@@ -80,6 +112,8 @@ app.add_middleware(
         "X-Normalize-Duration-Ms",
         "X-Normalize-Input-Codec",
         "X-Normalize-Remuxed",
+        "X-Segment-Backend",
+        "X-Segment-Duration-Ms",
         "Content-Length",
     ],
 )
@@ -88,8 +122,8 @@ app.add_middleware(
 # Error handling --------------------------------------------------------------
 
 
-@app.exception_handler(NormalizeError)
-async def normalize_error_handler(_: Request, exc: NormalizeError) -> JSONResponse:
+@app.exception_handler(ServiceError)
+async def service_error_handler(_: Request, exc: ServiceError) -> JSONResponse:
     return JSONResponse(
         status_code=exc.status,
         content={"error": exc.code, "message": exc.message},
@@ -475,6 +509,144 @@ async def normalize_job_result(request: Request, job_id: str) -> Response:
             request.app.state.jobs.pop(job_id, None)
 
     return StreamingResponse(streamer(), media_type="video/mp4", headers=job.headers)
+
+
+# --- Segmentation route -----------------------------------------------------
+
+
+async def _read_upload(file: UploadFile, limit: int) -> bytes:
+    """Buffer a single small image into memory, enforcing `limit`."""
+    chunks: list[bytes] = []
+    total = 0
+    while True:
+        chunk = await file.read(UPLOAD_CHUNK)
+        if not chunk:
+            break
+        total += len(chunk)
+        if total > limit:
+            raise UploadTooLarge(limit)
+        chunks.append(chunk)
+    return b"".join(chunks)
+
+
+@app.post("/v1/segment")
+async def segment(
+    request: Request,
+    file: UploadFile,
+    region: str = Form(...),
+    model: str = Form(SEGMENT_DEFAULT_MODEL),
+    classHint: str | None = Form(default=None),
+    content_length: int | None = Header(default=None, alias="Content-Length"),
+) -> JSONResponse:
+    """Re-fit an annotation to an object boundary.
+
+    Single-image, single-region. Always returns a polygon when successful;
+    the `X-Segment-Backend` header reports which CPU backend actually ran.
+    """
+    settings: Settings = request.app.state.settings
+    if content_length is not None and content_length > settings.segment_max_upload_bytes:
+        raise UploadTooLarge(settings.segment_max_upload_bytes)
+
+    started = time.monotonic()
+    file_bytes: bytes = b""
+    try:
+        file_bytes = await _read_upload(file, settings.segment_max_upload_bytes)
+    finally:
+        await file.close()
+
+    limiter: JobLimiter = request.app.state.segment_limiter
+    metrics.SEGMENT_QUEUE_LENGTH.set(limiter.waiting)
+
+    def _run() -> object:
+        return segment_image(
+            file_bytes=file_bytes,
+            region_raw=region,
+            model=model,
+            class_hint=classHint,
+            crop_padding=settings.segment_crop_padding,
+            epsilon_norm=settings.segment_polygon_epsilon,
+        )
+
+    try:
+        async with limiter.slot():
+            metrics.SEGMENT_CONCURRENT.set(limiter.active)
+            try:
+                result = await asyncio.wait_for(
+                    asyncio.to_thread(_run),
+                    timeout=settings.segment_timeout_s,
+                )
+            finally:
+                metrics.SEGMENT_CONCURRENT.set(max(0, limiter.active - 1))
+    except asyncio.TimeoutError:
+        metrics.SEGMENT_TOTAL.labels(outcome="timeout", model=model).inc()
+        logger.warning("segment.timeout", extra={"model": model})
+        return JSONResponse(
+            status_code=504,
+            content={"error": "timeout", "message": "segmentation exceeded budget"},
+        )
+    except SegmentError as exc:
+        metrics.SEGMENT_TOTAL.labels(outcome=exc.code, model=model).inc()
+        # Re-raise so the central exception handler shapes the response.
+        raise
+    except Exception as exc:  # noqa: BLE001 - convert to 500
+        metrics.SEGMENT_TOTAL.labels(outcome="internal_error", model=model).inc()
+        logger.exception("segment.crash", extra={"model": model})
+        return JSONResponse(
+            status_code=500,
+            content={"error": "internal_error", "message": "segmentation failed"},
+        )
+
+    duration_ms = int((time.monotonic() - started) * 1000)
+    if result is None:
+        metrics.SEGMENT_TOTAL.labels(outcome="no_object", model=model).inc()
+        # No-op contract: empty body, 200. Client preserves the existing label.
+        return JSONResponse(
+            status_code=200,
+            content={},
+            headers={"X-Segment-Duration-Ms": str(duration_ms)},
+        )
+
+    metrics.SEGMENT_TOTAL.labels(outcome="success", model=model).inc()
+    metrics.SEGMENT_DURATION_SECONDS.labels(
+        model=model, backend=result.backend_id
+    ).observe(duration_ms / 1000.0)
+    logger.info(
+        "segment.done",
+        extra={
+            "model": model,
+            "backend": result.backend_id,
+            "duration_ms": duration_ms,
+            "score": result.score,
+            "ring_count": len(result.polygon),
+            "point_count": sum(len(r) for r in result.polygon),
+        },
+    )
+    return JSONResponse(
+        status_code=200,
+        content=result.to_response(),
+        headers={
+            "X-Segment-Backend": result.backend_id,
+            "X-Segment-Duration-Ms": str(duration_ms),
+        },
+    )
+
+
+@app.get("/v1/segment/models")
+async def segment_models() -> JSONResponse:
+    """Introspection: which model ids the server accepts and the backend each maps to."""
+    from .segment.registry import _ROUTING  # local import to avoid leaking internals
+
+    items = []
+    for model_id in SEGMENT_SUPPORTED_MODELS:
+        spec = _ROUTING.get(model_id)
+        items.append(
+            {
+                "id": model_id,
+                "default": model_id == SEGMENT_DEFAULT_MODEL,
+                "backend": spec.backend_id if spec else None,
+            }
+        )
+    return JSONResponse({"models": items, "default": SEGMENT_DEFAULT_MODEL})
 
 
 def main() -> None:

@@ -2,6 +2,8 @@
 
 브라우저에서 직접 재생 불가능한 비디오(AVI/MKV/WMV/FLV 등)를 H.264/AAC MP4로 재인코딩해서 반환하는 FastAPI 마이크로서비스. 클라이언트(`ServerNormalizeAdapter`, `features/media/service/normalize.ts`)가 기대하는 계약에 맞춰 구현됨.
 
+같은 프로세스에서 이미지 세그먼테이션 엔드포인트 (`POST /v1/segment`) 도 제공한다. 라벨 hover + `H` 단축키로 어노테이션 경계를 모델로 다시 맞추는 용도. **CPU-only** 전제. 다섯 개 public model id 는 각각 별개의 weight (`FastSAM-s`, `SAM 2.1-tiny`, `MobileSAM`, `YOLOv8n-seg`, `YOLO11x-seg`) 로 라우팅되며, weight 파일 전부 `./weights/` 에 리포와 함께 포함돼 airgapped 이미지 빌드 시 추가 다운로드가 필요 없다. 100MB 가 넘는 weight 는 60MB 청크로 split 해서 commit, Dockerfile 빌드 단계에서 자동 reassemble. 자세한 내용은 §1.5 / §9 참조.
+
 ---
 
 ## 1. 인터페이스 계약
@@ -60,6 +62,68 @@
 | `ffmpeg_unavailable` | 503 | `/healthz`에서만, ffmpeg 바이너리 실행 불가 |
 
 > `ffprobe_unavailable` 503은 `/v1/normalize` 응답에서도 발생. 클라이언트는 non-2xx를 보고 자동으로 wasm 폴백으로 전환하므로 사용자 입장에서는 투명하게 넘어감.
+
+### `POST /v1/segment`
+
+라벨 hover + `H` 단축키로 호출되는 이미지 세그먼테이션 엔드포인트. 한 번의 요청 = 한 어노테이션 재-맞춤.
+
+| 항목 | 값 |
+|---|---|
+| Method | `POST` |
+| Content-Type (요청) | `multipart/form-data` |
+| `file` (필수) | 단일 프레임 JPEG/PNG 바이트 |
+| `region` (필수) | JSON 문자열 `{"x":0..1,"y":0..1,"w":>0,"h":>0}` (정규화 좌표) |
+| `model` (옵션) | `sam3` (기본) / `sam2` / `sam` / `mask2former` / `mask-rcnn` |
+| `classHint` (옵션) | 라벨 클래스 힌트 — 향후 모델 conditioning 용 (현재 MVP 는 로깅만) |
+
+**응답** (`200 OK`, `application/json`)
+
+```json
+{
+  "polygon": [[[x,y], ...], ...],
+  "rect":  {"x":..., "y":..., "w":..., "h":...},
+  "score": 0.93
+}
+```
+
+- `polygon` ring 0 = 외곽 boundary, ring 1.. = holes (even-odd fill).
+- 좌표는 정규화 `[0..1]`, 좌상단 원점.
+- 모델이 객체를 못 찾으면 `200 {}` (no-op) — 클라이언트는 기존 라벨 유지.
+
+**응답 헤더**
+
+- `X-Segment-Backend` — 실제로 추론한 CPU 백엔드 id (예: `fastsam-s`, `sam2.1-tiny`, `mobile-sam`, `yolov8n-seg`, `yolo11x-seg`)
+- `X-Segment-Duration-Ms` — 서버 처리 시간
+
+**에러**
+
+| 시나리오 | HTTP | `error` |
+|---|---|---|
+| 지원하지 않는 `model` id | 400 | `unsupported model` |
+| `region` JSON 파싱/범위 실패 | 400 | `invalid_region` |
+| 이미지 디코딩 실패 | 400 | `image_decode_failed` |
+| 인식 못 하는 이미지 포맷 | 415 | `unsupported_media_type` |
+| 업로드 크기 초과 (`SEGMENT_MAX_UPLOAD_BYTES`) | 413 | `upload_too_large` |
+| 추론 시간 초과 (`SEGMENT_TIMEOUT_MS`) | 504 | `timeout` |
+| 백엔드 로드 실패 (가중치 누락 등) | 503 | `backend_unavailable` |
+
+#### 모델 라우팅 (MVP)
+
+`model` enum 은 프론트 계약. 실제 추론은 내부 CPU 백엔드로 라우팅되며, 운영시 `X-Segment-Backend` 헤더와 `GET /v1/segment/models` 로 실제 구현을 확인할 수 있다. 모든 백엔드가 ultralytics 기반이라 의존성 스택은 단일하게 유지된다.
+
+| 클라이언트 `model` | 백엔드 | weight | 크기 | 비고 |
+|---|---|---|---|---|
+| `sam3` (default) | FastSAM-s | `weights/FastSAM-s.pt` | 23MB | bbox prompt, 일반 세그먼테이션, CPU 0.5–1.5s |
+| `sam2` | SAM 2.1-tiny | `weights/sam2.1_t.pt` | 75MB | Meta SAM 2.1 정식 (tiny), CPU 4–6s |
+| `sam` | MobileSAM | `weights/mobile_sam.pt` | 39MB | 원본 SAM 호환 경량 변종, CPU 1–2s |
+| `mask-rcnn` | YOLOv8n-seg | `weights/yolov8n-seg.pt` | 7MB | COCO 80 class, `classHint` 로 필터, CPU 0.1–0.3s |
+| `mask2former` | YOLO11x-seg | `weights/yolo11x-seg.pt` (split) | 120MB | 가장 무거운 instance seg, CPU 1–2s. **120MB 라 60MB 두 청크로 split 후 커밋, 빌드시 자동 reassemble** |
+
+> Mask2Former 정식 weight 는 huggingface / dl.fbaipublicfiles.com 에 있어서 빌드 환경에서 직접 다운로드가 어렵다. 대안으로 가장 무거운 ultralytics seg 모델인 YOLO11x-seg 로 라우팅. 추후 정식 Mask2Former 가 필요하면 §9 참조.
+
+### `GET /v1/segment/models`
+
+서버가 받아들이는 model id, 기본값, 실제 매핑된 백엔드를 노출 (introspection / 디버깅).
 
 ### `GET /healthz`
 
@@ -153,6 +217,13 @@ ffmpeg -nostdin -y -i <IN>
 | `FFMPEG_EXTRA_ARGS` | — | 튜닝용 추가 인자 (shell-split) |
 | `TEMP_DIR` | 시스템 기본 | 임시 작업 디렉토리 |
 | `LOG_LEVEL` | `INFO` | 로그 레벨 |
+| `SEGMENT_MAX_CONCURRENT` | `2` | `/v1/segment` 동시 추론 슬롯 (CPU 부하 제한) |
+| `SEGMENT_TIMEOUT_MS` | `30000` | 단일 세그먼테이션 요청 wall-clock 한도 |
+| `SEGMENT_MAX_UPLOAD_BYTES` | `16777216` (16MB) | 단일 프레임 업로드 한도 |
+| `SEGMENT_CROP_PADDING` | `0.20` | bbox 주변 crop 패딩 비율 (CPU 절약) |
+| `SEGMENT_POLYGON_EPSILON` | `0.002` | Douglas-Peucker 단순화 tolerance (정규화 좌표) |
+| `SEGMENT_WEIGHTS_DIR` | — | 모델 weight 디렉토리. Docker 이미지에서는 `/opt/segment-weights` 로 기본 설정됨 |
+| `SEGMENT_PRELOAD_MODELS` | — | startup 시 미리 로드할 model id (쉼표 구분, 예: `sam3`) |
 
 ---
 
@@ -167,16 +238,28 @@ ffmpeg -nostdin -y -i <IN>
 ├── app/
 │   ├── main.py             # FastAPI 앱, 라우트, 미들웨어, lifespan
 │   ├── config.py           # Settings (pydantic-settings)
-│   ├── errors.py           # NormalizeError 계층 (code/status 매핑)
+│   ├── errors.py           # ServiceError → NormalizeError / SegmentError 계층
 │   ├── probe.py            # ffprobe 래퍼, ProbeResult
 │   ├── normalize.py        # ffmpeg 커맨드 빌더 + 실행 + 타임아웃
 │   ├── jobs.py             # JobLimiter (세마포어 + 메트릭)
 │   ├── metrics.py          # Prometheus 레지스트리/메트릭
-│   └── logging_conf.py     # JSON 포매터
+│   ├── logging_conf.py     # JSON 포매터
+│   └── segment/            # /v1/segment 파이프라인
+│       ├── service.py      # 입력 파싱 → crop → 추론 → 폴리곤 변환
+│       ├── registry.py     # public model id → CPU 백엔드 매핑 (lazy load)
+│       ├── polygon.py      # mask → polygon ring 변환 (cv2 + DP simplify)
+│       └── backends/       # FastSAM / SAM(2,Mobile) / YOLO-seg (전부 ultralytics)
+├── weights/                # 5종 모델 weight 리포 포함 — airgapped 즉시 사용
+│   ├── FastSAM-s.pt        # sam3 (23MB)
+│   ├── sam2.1_t.pt         # sam2 (75MB)
+│   ├── mobile_sam.pt       # sam (39MB)
+│   ├── yolov8n-seg.pt      # mask-rcnn (7MB)
+│   └── yolo11x-seg.pt.part_00 / .part_01   # mask2former (120MB, split)
 └── tests/
     ├── test_build_ffmpeg_cmd.py   # argv 빌더 검증 (F-2.*, F-5.2)
     ├── test_probe.py              # 회전 추출, is_web_compatible
-    └── test_api.py                # 라우트 계약 (스텁된 ffmpeg)
+    ├── test_api.py                # 라우트 계약 (스텁된 ffmpeg)
+    └── test_segment.py            # /v1/segment + 폴리곤 유틸 (스텁된 백엔드)
 ```
 
 ---
@@ -215,6 +298,25 @@ docker run --rm -p 8000:8000 \
   videonizer-normalize
 ```
 
+#### 폐쇄망 (airgapped) 빌드
+
+모델 weight 는 `./weights/FastSAM-s.pt` 로 **리포에 직접 포함** 되어 있고, Dockerfile 이 `/opt/segment-weights/` 로 복사한 뒤 `SEGMENT_WEIGHTS_DIR` / `YOLO_CONFIG_DIR` env 를 걸어두기 때문에, 추가 다운로드 없이 이미지만 빌드하면 된다. 런타임에서 네트워크를 안 친다.
+
+내부 pypi 미러 사용 시 `PIP_INDEX_URL` / `PIP_EXTRA_INDEX_URL` / `PIP_TRUSTED_HOST` build-arg 로 pip 인덱스를 우회한다:
+
+```bash
+docker build \
+  --build-arg PIP_INDEX_URL=<your-internal-index-url> \
+  --build-arg PIP_EXTRA_INDEX_URL=<your-internal-extra-index-url> \
+  --build-arg PIP_TRUSTED_HOST=<your-internal-host> \
+  -t videonizer .
+```
+
+**주의사항**
+
+- 내부 미러에 `torch==2.5.1` 이 있는지 확인할 것. 일반 pypi proxy 라면 CUDA wheel (~800MB install) 이 깔린다. 디스크 아끼려면 **CPU wheel** 을 미러에 별도 업로드하거나, 미러에 `download.pytorch.org/whl/cpu` proxy 를 추가해달라고 요청 권장.
+- `ultralytics` 버전 중 8.3.45 / 8.3.46 은 upstream 에서 yank 되어 미러에서 404 가 날 수 있다. 현재 pin 은 `8.3.44`.
+
 ### 클라이언트 설정
 
 ```bash
@@ -242,3 +344,15 @@ NEXT_PUBLIC_VIDEO_NORMALIZE_ENDPOINT=http://localhost:8080/v1/normalize?async_jo
 - F-5.5 인증 — 단기 서명 토큰 헤더 검증 미들웨어
 - F-8.1 진행률 스트리밍 — ffmpeg stderr 파싱 → SSE 또는 `X-Progress` 트레일러
 - 수용 기준 통합 테스트 — 실제 샘플 영상 픽스처로 Chrome/Safari/Firefox 재생 회귀
+
+---
+
+## 9. 세그먼테이션 다음 단계 (MVP → Phase 2)
+
+현재 MVP 는 **다섯 개 client model id 가 각각 별개 weight + 백엔드 인스턴스로 라우팅**된다 (`app/segment/registry.py::_ROUTING`). 후속 패스 후보:
+
+1. **Mask2Former 정식 모델** — 현재 `mask2former` id 는 YOLO11x-seg 로 라우팅 중. 진짜 Mask2Former Swin-Tiny (HF `facebook/mask2former-swin-tiny-coco-instance`) 로 가려면 ~200MB 가중치를 split 4 청크로 commit + `transformers` 패키지 추가 + 새 백엔드 클래스 (`Mask2FormerBackend`) 작성 필요. 빌드 환경에서 huggingface 접속이 막혀 MVP 에서 미구현.
+2. **이미지 임베딩 캐시** — `(frame_hash, model)` LRU. 같은 프레임에서 여러 라벨을 다시-맞출 때 image encoder 재실행 회피 (SAM 계열 비용의 80%).
+3. **ONNX Runtime + INT8** — 양자화된 ONNX 변종으로 교체. 의존성 무게도 가벼워짐 (`ultralytics` / `torch` 제거 가능).
+4. **GPU 분리** — `SEGMENT_REMOTE_URL` env 로 추론을 별도 GPU 서비스에 위임. 본 서비스는 프록시 + 폴리곤 변환만 담당.
+5. **다중 오브젝트 탐지 엔드포인트** — `POST /v1/detect` 로 분리. 현재 `/v1/segment` 는 단일 오브젝트 계약 유지.
