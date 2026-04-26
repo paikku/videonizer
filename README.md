@@ -97,15 +97,27 @@
 
 **에러**
 
-| 시나리오 | HTTP | `error` |
-|---|---|---|
-| 지원하지 않는 `model` id | 400 | `unsupported model` |
-| `region` JSON 파싱/범위 실패 | 400 | `invalid_region` |
-| 이미지 디코딩 실패 | 400 | `image_decode_failed` |
-| 인식 못 하는 이미지 포맷 | 415 | `unsupported_media_type` |
-| 업로드 크기 초과 (`SEGMENT_MAX_UPLOAD_BYTES`) | 413 | `upload_too_large` |
-| 추론 시간 초과 (`SEGMENT_TIMEOUT_MS`) | 504 | `timeout` |
-| 백엔드 로드 실패 (가중치 누락 등) | 503 | `backend_unavailable` |
+| 시나리오 | HTTP | `error` | 비고 |
+|---|---|---|---|
+| 지원하지 않는 `model` id | 400 | `unsupported model` | |
+| `region` JSON 파싱/범위 실패 | 400 | `invalid_region` | |
+| 이미지 디코딩 실패 | 400 | `image_decode_failed` | |
+| 인식 못 하는 이미지 포맷 | 415 | `unsupported_media_type` | |
+| 업로드 크기 초과 (`SEGMENT_MAX_UPLOAD_BYTES`) | 413 | `upload_too_large` | |
+| 추론 시간 초과 (`SEGMENT_TIMEOUT_MS`) | 504 | `timeout` | 슬롯 획득 후 추론 단계 |
+| 큐 대기 시간 초과 (`SEGMENT_ACQUIRE_TIMEOUT_MS`) | 503 | `busy` | `Retry-After: 2` |
+| 큐 길이 cap 초과 (`SEGMENT_MAX_QUEUE`) | 503 | `busy` | `Retry-After: 1` |
+| 백엔드 로드 실패 (가중치 누락 등) | 503 | `backend_unavailable` | |
+
+#### 부하 제어 / 동시성 정책
+
+`/v1/segment` 는 CPU 추론이 무거워 burst 트래픽에 약하다. 다음 3단 방어로 *서버가 응답을 못하는* 상태를 막는다:
+
+1. **큐 길이 cap (`SEGMENT_MAX_QUEUE`)** — 대기 큐가 가득 차면 즉시 `503 + Retry-After: 1` 반환. 무제한 큐가 쌓여 프록시 타임아웃이 먼저 터지는 패턴(클라이언트는 hang 으로 보임)을 차단한다.
+2. **acquire timeout (`SEGMENT_ACQUIRE_TIMEOUT_MS`)** — 슬롯을 잡지 못하고 대기하던 요청도 일정 시간이 지나면 `503 + Retry-After: 2` 로 반환. `SEGMENT_TIMEOUT_MS` (추론 단계) 와 별도.
+3. **슬롯-스레드 결합** — `asyncio.wait_for` 가 추론 타임아웃되면 클라이언트엔 `504` 를 즉시 보내지만 워커 스레드(파이썬 스레드는 cooperative cancel 불가)가 실제로 종료될 때까지 세마포어를 잡고 있는다. 이 결합이 없으면 좀비 스레드 위에 새 추론이 누적돼 결국 `SEGMENT_MAX_CONCURRENT` 보다 훨씬 많은 동시 추론이 돌고, 박스가 OOM/스왑으로 wedge 되어 *어떤 요청에도 응답하지 못하는* 상태가 된다.
+
+프런트(`vision/segment.ts`) 는 `503/5xx/timeout` 을 transient 로 분류해 지수 백오프 재시도하므로, 서버가 빠르게 503 을 돌려주면 사용자 입장에선 잠깐 지연될 뿐 작업이 실패하지 않는다.
 
 #### 모델 라우팅 (MVP)
 
@@ -187,7 +199,7 @@ ffmpeg -nostdin -y -i <IN>
 | F-3.1 VFR 타임스탬프 보존 | `-fps_mode passthrough` |
 | F-3.2 회전 반영 + 메타 제거 | rotation != 0이면 재인코딩 + `rotate=0` |
 | F-3.3 duration ±0.1s | passthrough + 코덱 레벨 timestamp 보존 |
-| F-4.1 동시성 제한 + 큐잉 | `JobLimiter` (`asyncio.Semaphore`) |
+| F-4.1 동시성 제한 + 큐잉 | `JobLimiter` (`asyncio.Semaphore`) — segment 경로는 `_run_segment_in_slot` 가 큐 cap·acquire timeout·스레드-슬롯 결합까지 추가 |
 | F-4.2 타임아웃 + 강제종료 | `_run_ffmpeg`: `start_new_session` + `os.killpg(SIGKILL)` |
 | F-4.3 임시파일 정리 | 성공/실패/타임아웃 모두 `shutil.rmtree` |
 | F-4.4 하드웨어 인코더 튜닝 | `FFMPEG_EXTRA_ARGS` 로 외부 주입 |
@@ -218,7 +230,9 @@ ffmpeg -nostdin -y -i <IN>
 | `TEMP_DIR` | 시스템 기본 | 임시 작업 디렉토리 |
 | `LOG_LEVEL` | `INFO` | 로그 레벨 |
 | `SEGMENT_MAX_CONCURRENT` | `2` | `/v1/segment` 동시 추론 슬롯 (CPU 부하 제한) |
-| `SEGMENT_TIMEOUT_MS` | `30000` | 단일 세그먼테이션 요청 wall-clock 한도 |
+| `SEGMENT_TIMEOUT_MS` | `30000` | 슬롯 획득 후 단일 추론 wall-clock 한도. 초과 시 504 반환 |
+| `SEGMENT_MAX_QUEUE` | `16` | 슬롯 대기 큐 길이 cap. 초과 시 즉시 503 + `Retry-After: 1` (0=무제한, 권장 X) |
+| `SEGMENT_ACQUIRE_TIMEOUT_MS` | `10000` | 슬롯 대기 한도. 초과 시 503 + `Retry-After: 2` |
 | `SEGMENT_MAX_UPLOAD_BYTES` | `16777216` (16MB) | 단일 프레임 업로드 한도 |
 | `SEGMENT_CROP_PADDING` | `0.20` | bbox 주변 crop 패딩 비율 (CPU 절약) |
 | `SEGMENT_POLYGON_EPSILON` | `0.002` | Douglas-Peucker 단순화 tolerance (정규화 좌표) |

@@ -21,6 +21,7 @@ from . import metrics
 from .config import Settings, get_settings
 from .errors import (
     NormalizeError,
+    SegmentBusy,
     SegmentError,
     ServiceError,
     UploadTooLarge,
@@ -514,6 +515,84 @@ async def normalize_job_result(request: Request, job_id: str) -> Response:
 # --- Segmentation route -----------------------------------------------------
 
 
+async def _run_segment_in_slot(
+    *,
+    request: Request,
+    limiter: JobLimiter,
+    settings: Settings,
+    run,
+    model: str,
+):
+    """Acquire a segment worker slot, then run `run()` in a thread.
+
+    Two stability guarantees that the naive
+    ``async with limiter.slot(): await asyncio.wait_for(asyncio.to_thread(run), …)``
+    pattern lacks:
+
+    1. **Bounded acquire wait.** We won't wait forever for a slot. If
+       `segment_acquire_timeout_ms` elapses before we get one, we raise
+       :class:`SegmentBusy` (HTTP 503) so the proxy's own timeout doesn't
+       fire first and leave the client with an opaque hang.
+    2. **Slot-tied to the worker thread, not the awaiter.** When inference
+       exceeds `segment_timeout_ms` we surface 504 to the client *but the
+       semaphore stays held* until the still-running OS thread exits.
+       Python threads can't be cancelled cooperatively, so releasing the
+       semaphore on `wait_for` timeout would let new requests pile new
+       inferences on top of the stale one — the box ends up running far
+       more concurrent inferences than `segment_max_concurrent`, and
+       eventually wedges (no responses at all). Holding the slot caps
+       real concurrency at the configured ceiling even under burst load.
+    """
+    try:
+        await limiter.acquire(timeout=settings.segment_acquire_timeout_s)
+    except asyncio.TimeoutError as exc:
+        raise SegmentBusy("segmentation workers busy, retry shortly") from exc
+
+    metrics.SEGMENT_CONCURRENT.set(limiter.active)
+    metrics.SEGMENT_QUEUE_LENGTH.set(limiter.waiting)
+
+    worker = asyncio.create_task(asyncio.to_thread(run))
+    released = False
+
+    async def _release_when_thread_exits() -> None:
+        nonlocal released
+        if released:
+            return
+        released = True
+        try:
+            await worker
+        except Exception:
+            pass
+        finally:
+            await limiter.release()
+            metrics.SEGMENT_CONCURRENT.set(limiter.active)
+
+    try:
+        # `shield` prevents wait_for from cancelling the worker task on
+        # timeout — the OS thread under it can't be cancelled anyway, so
+        # cancelling its wrapper would just orphan the thread.
+        result = await asyncio.wait_for(
+            asyncio.shield(worker), timeout=settings.segment_timeout_s
+        )
+    except asyncio.TimeoutError:
+        # Detach: respond 504 now, but keep the slot held until the
+        # background inference truly finishes (or crashes).
+        asyncio.create_task(_release_when_thread_exits())
+        raise
+    except BaseException:
+        # Includes asyncio.CancelledError from a client disconnect. Let
+        # the inference finish and free its slot in the background; never
+        # release the semaphore from a path that doesn't actually own
+        # the thread.
+        asyncio.create_task(_release_when_thread_exits())
+        raise
+
+    # Worker already completed. Free the slot synchronously through the
+    # same helper so book-keeping stays in one place.
+    await _release_when_thread_exits()
+    return result
+
+
 async def _read_upload(file: UploadFile, limit: int) -> bytes:
     """Buffer a single small image into memory, enforcing `limit`."""
     chunks: list[bytes] = []
@@ -557,6 +636,28 @@ async def segment(
     limiter: JobLimiter = request.app.state.segment_limiter
     metrics.SEGMENT_QUEUE_LENGTH.set(limiter.waiting)
 
+    # Shed load when the queue is already saturated. Without this guard a
+    # burst of clients piles into an unbounded asyncio.Semaphore wait list
+    # and the proxy's own timeout fires before any of them get a slot —
+    # the user-visible symptom is "the server stopped responding". The
+    # client retries 503 with backoff (see vision/segment.ts), so refusing
+    # fast is friendlier than letting the request rot.
+    max_queue = settings.segment_max_queue
+    if max_queue > 0 and limiter.waiting >= max_queue:
+        metrics.SEGMENT_TOTAL.labels(outcome="busy", model=model).inc()
+        logger.warning(
+            "segment.busy",
+            extra={"model": model, "waiting": limiter.waiting, "active": limiter.active},
+        )
+        return JSONResponse(
+            status_code=503,
+            content={
+                "error": "busy",
+                "message": "segmentation queue full, retry shortly",
+            },
+            headers={"Retry-After": "1"},
+        )
+
     def _run() -> object:
         return segment_image(
             file_bytes=file_bytes,
@@ -568,21 +669,32 @@ async def segment(
         )
 
     try:
-        async with limiter.slot():
-            metrics.SEGMENT_CONCURRENT.set(limiter.active)
-            try:
-                result = await asyncio.wait_for(
-                    asyncio.to_thread(_run),
-                    timeout=settings.segment_timeout_s,
-                )
-            finally:
-                metrics.SEGMENT_CONCURRENT.set(max(0, limiter.active - 1))
+        result = await _run_segment_in_slot(
+            request=request,
+            limiter=limiter,
+            settings=settings,
+            run=_run,
+            model=model,
+        )
     except asyncio.TimeoutError:
         metrics.SEGMENT_TOTAL.labels(outcome="timeout", model=model).inc()
         logger.warning("segment.timeout", extra={"model": model})
         return JSONResponse(
             status_code=504,
             content={"error": "timeout", "message": "segmentation exceeded budget"},
+        )
+    except SegmentBusy as exc:
+        # Acquire-timeout: never got a worker slot. Treat as 503 + Retry-After
+        # so the client backs off instead of hammering an overloaded box.
+        metrics.SEGMENT_TOTAL.labels(outcome="busy", model=model).inc()
+        logger.warning(
+            "segment.acquire_timeout",
+            extra={"model": model, "waiting": limiter.waiting, "active": limiter.active},
+        )
+        return JSONResponse(
+            status_code=exc.status,
+            content={"error": exc.code, "message": exc.message},
+            headers={"Retry-After": "2"},
         )
     except SegmentError as exc:
         metrics.SEGMENT_TOTAL.labels(outcome=exc.code, model=model).inc()

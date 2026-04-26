@@ -23,13 +23,22 @@ class JobLimiter:
     def waiting(self) -> int:
         return self._waiting
 
-    @asynccontextmanager
-    async def slot(self):
+    async def acquire(self, *, timeout: float | None = None) -> None:
+        """Acquire a worker slot, blocking until one is free.
+
+        When `timeout` is provided and elapses before a slot is available,
+        raises :class:`asyncio.TimeoutError` and leaves the limiter state
+        unchanged. The matching :meth:`release` must be called exactly
+        once after a successful acquire.
+        """
         async with self._lock:
             self._waiting += 1
             metrics.QUEUE_LENGTH.set(self._waiting)
         try:
-            await self._sem.acquire()
+            if timeout is None:
+                await self._sem.acquire()
+            else:
+                await asyncio.wait_for(self._sem.acquire(), timeout=timeout)
         finally:
             async with self._lock:
                 self._waiting -= 1
@@ -37,10 +46,18 @@ class JobLimiter:
         async with self._lock:
             self._active += 1
             metrics.CONCURRENT_JOBS.set(self._active)
+
+    async def release(self) -> None:
+        """Release a slot previously taken by :meth:`acquire`."""
+        async with self._lock:
+            self._active -= 1
+            metrics.CONCURRENT_JOBS.set(self._active)
+        self._sem.release()
+
+    @asynccontextmanager
+    async def slot(self):
+        await self.acquire()
         try:
             yield
         finally:
-            async with self._lock:
-                self._active -= 1
-                metrics.CONCURRENT_JOBS.set(self._active)
-            self._sem.release()
+            await self.release()
