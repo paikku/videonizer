@@ -31,6 +31,15 @@ class Settings(BaseSettings):
     # Per-request wall-clock budget. SAM/Mask R-CNN on CPU can take a few
     # seconds; cap so a runaway request doesn't pile up.
     segment_timeout_ms: int = 30_000
+    # Maximum number of requests allowed to queue waiting for a worker slot.
+    # Beyond this we shed load with 503 + Retry-After so a burst doesn't push
+    # the proxy past its own timeout while requests sit forever in the queue.
+    # Set to 0 to disable the cap (legacy behavior — not recommended).
+    segment_max_queue: int = 16
+    # How long a request may wait for a worker slot before we abandon it
+    # with 504. Independent of `segment_timeout_ms`, which only starts
+    # counting once inference has begun.
+    segment_acquire_timeout_ms: int = 10_000
     # Cap upload size for /v1/segment (single frame, much smaller than video).
     segment_max_upload_bytes: int = 16 * 1024 * 1024
     # Crop padding around the prompt bbox before inference (fraction of bbox).
@@ -58,6 +67,10 @@ class Settings(BaseSettings):
     @property
     def segment_timeout_s(self) -> float:
         return self.segment_timeout_ms / 1000.0
+
+    @property
+    def segment_acquire_timeout_s(self) -> float:
+        return self.segment_acquire_timeout_ms / 1000.0
 
     @property
     def segment_preload_models_list(self) -> list[str]:
