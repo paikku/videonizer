@@ -19,6 +19,7 @@ from ..domain.projects import (
 )
 from ..errors import NotFound
 from ..storage.repo.images import ImageRepo
+from ..storage.repo.labelsets import LabelSetRepo
 from ..storage.repo.projects import Project as ProjectRow, ProjectRepo
 from ..storage.repo.resources import ResourceRepo
 from ._deps import current_user_id, get_session
@@ -35,15 +36,15 @@ def _to_summary(
     *,
     resource_count: int = 0,
     image_count: int = 0,
+    label_set_count: int = 0,
 ) -> ProjectSummary:
-    # label_set_count remains a placeholder until PR #5.
     return ProjectSummary(
         id=row.id,
         name=row.name,
         created_at=row.created_at,
         resource_count=resource_count,
         image_count=image_count,
-        label_set_count=0,
+        label_set_count=label_set_count,
     )
 
 
@@ -55,13 +56,22 @@ async def list_projects(
     rows = await ProjectRepo(session).list_all()
     res_repo = ResourceRepo(session)
     img_repo = ImageRepo(session)
+    ls_repo = LabelSetRepo(session)
     summaries: list[ProjectSummary] = []
     for r in rows:
         # N+1 is fine for the small project counts we expect; can collapse
         # to a single GROUP BY later if it shows up in profiling.
         rc = await res_repo.count_for_project(r.id)
         ic = await img_repo.count_for_project(r.id)
-        summaries.append(_to_summary(r, resource_count=rc, image_count=ic))
+        lsc = await ls_repo.count_for_project(r.id)
+        summaries.append(
+            _to_summary(
+                r,
+                resource_count=rc,
+                image_count=ic,
+                label_set_count=lsc,
+            )
+        )
     return ProjectListResponse(projects=summaries)
 
 

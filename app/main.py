@@ -185,10 +185,12 @@ app = FastAPI(title="Videonizer Normalize Service", version="0.1.0", lifespan=li
 from .api.projects import router as projects_router  # noqa: E402
 from .api.resources import router as resources_router  # noqa: E402
 from .api.images import router as images_router  # noqa: E402
+from .api.labelsets import router as labelsets_router  # noqa: E402
 
 app.include_router(projects_router)
 app.include_router(resources_router)
 app.include_router(images_router)
+app.include_router(labelsets_router)
 
 
 # CORS ------------------------------------------------------------------------
