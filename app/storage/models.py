@@ -12,4 +12,4 @@ from .repo.projects import Project  # noqa: F401
 from .repo.resources import Resource  # noqa: F401
 from .repo.images import Image  # noqa: F401
 from .repo.labelsets import LabelSet  # noqa: F401
-# PR #6: from .repo.annotations import Annotation  # noqa: F401
+from .repo.annotations import Annotation  # noqa: F401

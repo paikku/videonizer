@@ -12,6 +12,7 @@ asyncpg==0.30.0
 aiosqlite==0.20.0
 alembic==1.18.4
 boto3==1.43.2
+zipstream-ng==1.7.1
 
 # --- Segmentation (CPU-only) -------------------------------------------------
 numpy==1.26.4
