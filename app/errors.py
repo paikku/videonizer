@@ -109,3 +109,26 @@ class SegmentBackendUnavailable(SegmentError):
 class SegmentBusy(SegmentError):
     def __init__(self, message: str = "all segment workers busy") -> None:
         super().__init__("busy", message, 503)
+
+
+# --- Stateful API generic errors -------------------------------------------
+
+
+class NotFound(ServiceError):
+    def __init__(self, code: str = "not_found", message: str = "not found") -> None:
+        super().__init__(code, message, 404)
+
+
+class ValidationError(ServiceError):
+    def __init__(self, message: str, *, code: str = "validation_failed") -> None:
+        super().__init__(code, message, 422)
+
+
+class BadRequest(ServiceError):
+    def __init__(self, message: str, *, code: str = "bad_request") -> None:
+        super().__init__(code, message, 400)
+
+
+class Conflict(ServiceError):
+    def __init__(self, message: str, *, code: str = "conflict") -> None:
+        super().__init__(code, message, 409)

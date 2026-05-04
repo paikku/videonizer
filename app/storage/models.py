@@ -8,7 +8,7 @@ PR #1 ships an empty baseline; subsequent PRs extend.
 """
 from __future__ import annotations
 
-# PR #2: from .repo.projects import Project  # noqa: F401
+from .repo.projects import Project  # noqa: F401
 # PR #3: from .repo.resources import Resource  # noqa: F401
 # PR #4: from .repo.images import Image  # noqa: F401
 # PR #5: from .repo.labelsets import LabelSet  # noqa: F401

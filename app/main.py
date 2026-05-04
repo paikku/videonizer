@@ -177,6 +177,16 @@ async def _run_migrations(database_url: str) -> None:
 app = FastAPI(title="Videonizer Normalize Service", version="0.1.0", lifespan=lifespan)
 
 
+# Stateful API routers ------------------------------------------------------
+# These are always mounted; if the lifespan didn't bring DB/S3 up, calls hit
+# RuntimeError("DB engine not initialized") and bubble out as 500. That's the
+# right loudness for a misconfigured deploy — the alternative (silently 404)
+# hides the problem.
+from .api.projects import router as projects_router  # noqa: E402
+
+app.include_router(projects_router)
+
+
 # CORS ------------------------------------------------------------------------
 
 _settings_boot = get_settings()

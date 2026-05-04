@@ -24,11 +24,16 @@ async def test_db_ping(stateful_app, session_factory) -> None:
         assert result.scalar() == 1
 
 
-async def test_alembic_baseline_present(stateful_app, session_factory) -> None:
-    """alembic_version table should exist with the baseline rev."""
+async def test_alembic_at_head(stateful_app, session_factory) -> None:
+    """alembic_version table should exist and match the head revision."""
+    from alembic.config import Config
+    from alembic.script import ScriptDirectory
+
+    cfg = Config("alembic.ini")
+    head = ScriptDirectory.from_config(cfg).get_current_head()
     async with session_factory() as s:
         rev = await s.execute(text("SELECT version_num FROM alembic_version"))
-        assert rev.scalar() == "0001_baseline"
+        assert rev.scalar() == head
 
 
 # --- Blob store ------------------------------------------------------------
