@@ -18,6 +18,18 @@ For the work procedure, see `.agent/workflow.md`. For the bar that defines "done
 
 If a contract change is required to fix a bug, *update the contract first*, get the frontend onto the new version, then change the code. Don't ship code that diverges from the contract — even briefly — and call it forward-compatible.
 
+### Contract mirror
+
+`API_CONTRACT.md` exists in **both** repos: `videonizer/API_CONTRACT.md` (canonical) and `vision/API_CONTRACT.md` (mirror). They must stay byte-identical. The split-copy layout is intentional — the frontend developer reads the contract from inside their own repo without crossing repos.
+
+Sync rule:
+
+1. **Edit the canonical copy first** (`videonizer/API_CONTRACT.md`) in the same commit as the route change.
+2. **Mirror the new file verbatim** to `vision/API_CONTRACT.md` in a paired commit on the matching branch in vision. `cp ../videonizer/API_CONTRACT.md ./API_CONTRACT.md` is the expected one-liner.
+3. The two commits land together — frontend code that depends on the new contract field cannot land before the mirror is in place, otherwise its CI typecheck has nothing to read.
+
+Drift is a bug. CI in either repo may diff the two and fail; if `diff -q` ever surfaces a difference, fix in the same PR.
+
 ---
 
 ## 1) Reasonable assumptions over interrogation
