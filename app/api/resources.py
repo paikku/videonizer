@@ -24,6 +24,7 @@ from fastapi.responses import Response, StreamingResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..config import Settings, get_settings
+from ..domain.images import ImageBatchResponse, ImageMetaItem
 from ..domain.projects import OkResponse
 from ..domain.resources import (
     BulkDeleteRequest,
@@ -42,7 +43,9 @@ from ..services.blob_keys import (
     resource_source_key,
     safe_extension,
 )
+from ..services.image_ingest import ingest_one
 from ..services.uploads import stream_upload_to_blob, buffer_to_memory
+from ..storage.repo.images import ImageRepo
 from ..storage.blobs import BlobNotFound, BlobStore
 from ..storage.repo.projects import ProjectRepo
 from ..storage.repo.resources import (
@@ -119,7 +122,12 @@ async def list_resources(
 ) -> ResourceListResponse:
     await _require_project(session, project_id)
     rows = await ResourceRepo(session).list_for_project(project_id)
-    return ResourceListResponse(resources=[_to_summary(r) for r in rows])
+    img_repo = ImageRepo(session)
+    summaries: list[ResourceSummary] = []
+    for r in rows:
+        c = await img_repo.count_for_resource(project_id, r.id)
+        summaries.append(_to_summary(r, image_count=c))
+    return ResourceListResponse(resources=summaries)
 
 
 # --- create ----------------------------------------------------------------
@@ -385,18 +393,71 @@ async def get_preview(
     )
 
 
-# --- image ingest stub (PR #4 fills in) ------------------------------------
+# --- image ingestion -------------------------------------------------------
 
 
-@router.post("/{resource_id}/images", status_code=status.HTTP_501_NOT_IMPLEMENTED)
-async def add_images_stub(
+def _parse_meta(raw: str | None) -> list[ImageMetaItem]:
+    if not raw:
+        raise BadRequest("meta is required", code="missing_meta")
+    try:
+        v = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise BadRequest(f"invalid meta JSON: {exc}", code="invalid_meta") from exc
+    if not isinstance(v, list):
+        raise BadRequest("meta must be a JSON array", code="invalid_meta")
+    items: list[ImageMetaItem] = []
+    for entry in v:
+        if not isinstance(entry, dict):
+            raise BadRequest("meta entries must be objects", code="invalid_meta")
+        try:
+            items.append(ImageMetaItem.model_validate(entry))
+        except Exception as exc:
+            raise BadRequest(f"invalid meta entry: {exc}", code="invalid_meta")
+    return items
+
+
+@router.post(
+    "/{resource_id}/images",
+    response_model=ImageBatchResponse,
+    status_code=status.HTTP_201_CREATED,
+)
+async def add_images(
     project_id: str,
     resource_id: str,
+    files: Annotated[list[UploadFile], File()],
+    meta: Annotated[str, Form()],
     session: AsyncSession = Depends(get_session),
+    store: BlobStore = Depends(get_store),
+    settings: Settings = Depends(get_settings),
     _user: str = Depends(current_user_id),
-) -> Response:
-    """Stub — full implementation lands in PR #4 (Image domain)."""
-    await _require_resource(session, project_id, resource_id)
-    raise BadRequest(
-        "image ingestion lands in PR #4", code="not_implemented_yet"
-    )
+) -> ImageBatchResponse:
+    resource = await _require_resource(session, project_id, resource_id)
+    metas = _parse_meta(meta)
+    if len(metas) != len(files):
+        raise BadRequest(
+            f"meta length ({len(metas)}) != files length ({len(files)})",
+            code="meta_mismatch",
+        )
+    if not files:
+        raise BadRequest("no files provided", code="empty_files")
+
+    # Frame ingestion is constrained by segment_max_upload_bytes since each
+    # file is roughly the size of a single frame; reuse that limit.
+    limit = settings.segment_max_upload_bytes
+
+    repo = ImageRepo(session)
+    created = []
+    for upload, meta_item in zip(files, metas):
+        row = await ingest_one(
+            project_id=project_id,
+            resource=resource,
+            upload=upload,
+            meta=meta_item,
+            store=store,
+            repo=repo,
+            upload_limit=limit,
+        )
+        created.append(row)
+
+    from .images import _to_dto as _image_dto  # local to avoid import cycle
+    return ImageBatchResponse(images=[_image_dto(r) for r in created])

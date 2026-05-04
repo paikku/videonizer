@@ -346,18 +346,5 @@ async def test_project_summary_resource_count(stateful_app, project_id) -> None:
     assert proj["resourceCount"] == 2
 
 
-# --- image stub returns 400 not_implemented_yet ---------------------------
-
-
-async def test_post_images_stub(stateful_app, project_id) -> None:
-    r = await stateful_app.post(
-        f"/api/projects/{project_id}/resources",
-        data={"type": "image_batch", "name": "b", "tags": "[]"},
-    )
-    rid = r.json()["resource"]["id"]
-    r2 = await stateful_app.post(
-        f"/api/projects/{project_id}/resources/{rid}/images"
-    )
-    # Domain-shaped 4xx is fine for now; PR #4 turns this into a real 201.
-    assert r2.status_code == 400
-    assert r2.json()["error"] == "not_implemented_yet"
+# Image ingestion (POST /resources/{rid}/images) is fully tested in
+# test_images_api.py; no stub-shaped test here anymore.
