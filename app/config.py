@@ -25,6 +25,10 @@ class Settings(BaseSettings):
     temp_dir: str | None = None
     log_level: str = "INFO"
 
+    # Filesystem root for project / resource / image / labelset state.
+    # Relative paths resolve against the process CWD.
+    storage_root: str = "storage"
+
     # --- Segmentation (/v1/segment) -----------------------------------------
     # CPU-only inference → keep concurrency tight to bound RAM/CPU.
     segment_max_concurrent: int = 2
