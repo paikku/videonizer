@@ -31,6 +31,7 @@ from .jobs import JobLimiter
 from .logging_conf import configure_logging
 from .normalize import iter_file, normalize_file
 from .routers import projects as projects_router
+from .routers import resources as resources_router
 from .segment import (
     DEFAULT_MODEL as SEGMENT_DEFAULT_MODEL,
     SUPPORTED_MODELS as SEGMENT_SUPPORTED_MODELS,
@@ -104,6 +105,7 @@ app = FastAPI(title="Videonizer Normalize Service", version="0.1.0", lifespan=li
 # Mount the project / resource / image / labelset routers below the
 # normalize and segment routes that live directly on `app`.
 app.include_router(projects_router.router)
+app.include_router(resources_router.router)
 
 
 # CORS ------------------------------------------------------------------------
