@@ -30,6 +30,7 @@ from .errors import (
 from .jobs import JobLimiter
 from .logging_conf import configure_logging
 from .normalize import iter_file, normalize_file
+from .routers import exports as exports_router
 from .routers import images as images_router
 from .routers import labelsets as labelsets_router
 from .routers import projects as projects_router
@@ -110,6 +111,10 @@ app.include_router(projects_router.router)
 app.include_router(resources_router.router)
 app.include_router(images_router.router)
 app.include_router(labelsets_router.router)
+# Export router prefix is more specific than the labelsets one — register
+# it after so FastAPI's longest-match still resolves correctly. Both have
+# distinct paths so order doesn't affect matching, only readability.
+app.include_router(exports_router.router)
 
 
 # CORS ------------------------------------------------------------------------
