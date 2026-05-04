@@ -46,6 +46,7 @@ def stateful_env(monkeypatch: pytest.MonkeyPatch, tmp_path, moto_server: str) ->
     """
     bucket = "videonizer-test"
     db_path = tmp_path / "test.sqlite3"
+    (tmp_path / "tmp").mkdir(parents=True, exist_ok=True)
     env = {
         # File-backed sqlite so the alembic engine and the app engine see
         # the same data (`:memory:` would isolate them per-connection).

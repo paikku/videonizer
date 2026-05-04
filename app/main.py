@@ -183,8 +183,10 @@ app = FastAPI(title="Videonizer Normalize Service", version="0.1.0", lifespan=li
 # right loudness for a misconfigured deploy — the alternative (silently 404)
 # hides the problem.
 from .api.projects import router as projects_router  # noqa: E402
+from .api.resources import router as resources_router  # noqa: E402
 
 app.include_router(projects_router)
+app.include_router(resources_router)
 
 
 # CORS ------------------------------------------------------------------------

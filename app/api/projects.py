@@ -19,6 +19,7 @@ from ..domain.projects import (
 )
 from ..errors import NotFound
 from ..storage.repo.projects import Project as ProjectRow, ProjectRepo
+from ..storage.repo.resources import ResourceRepo
 from ._deps import current_user_id, get_session
 
 router = APIRouter(prefix="/api/projects", tags=["projects"])
@@ -28,13 +29,13 @@ def _to_dto(row: ProjectRow) -> Project:
     return Project(id=row.id, name=row.name, created_at=row.created_at)
 
 
-def _to_summary(row: ProjectRow) -> ProjectSummary:
-    # Counts are placeholders; PR #3/#4/#5 fill them in.
+def _to_summary(row: ProjectRow, *, resource_count: int = 0) -> ProjectSummary:
+    # image_count + label_set_count remain placeholders until PR #4 / #5.
     return ProjectSummary(
         id=row.id,
         name=row.name,
         created_at=row.created_at,
-        resource_count=0,
+        resource_count=resource_count,
         image_count=0,
         label_set_count=0,
     )
@@ -46,7 +47,14 @@ async def list_projects(
     _user: str = Depends(current_user_id),
 ) -> ProjectListResponse:
     rows = await ProjectRepo(session).list_all()
-    return ProjectListResponse(projects=[_to_summary(r) for r in rows])
+    res_repo = ResourceRepo(session)
+    summaries: list[ProjectSummary] = []
+    for r in rows:
+        # N+1 is fine for the small project counts we expect; can collapse
+        # to a single GROUP BY later if it shows up in profiling.
+        rc = await res_repo.count_for_project(r.id)
+        summaries.append(_to_summary(r, resource_count=rc))
+    return ProjectListResponse(projects=summaries)
 
 
 @router.post(
