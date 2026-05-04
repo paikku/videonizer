@@ -13,6 +13,7 @@ from dataclasses import dataclass, field
 from typing import AsyncIterator, Literal
 
 from fastapi import FastAPI, Form, Header, Request, UploadFile
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
@@ -29,6 +30,7 @@ from .errors import (
 from .jobs import JobLimiter
 from .logging_conf import configure_logging
 from .normalize import iter_file, normalize_file
+from .routers import projects as projects_router
 from .segment import (
     DEFAULT_MODEL as SEGMENT_DEFAULT_MODEL,
     SUPPORTED_MODELS as SEGMENT_SUPPORTED_MODELS,
@@ -99,6 +101,10 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
 app = FastAPI(title="Videonizer Normalize Service", version="0.1.0", lifespan=lifespan)
 
+# Mount the project / resource / image / labelset routers below the
+# normalize and segment routes that live directly on `app`.
+app.include_router(projects_router.router)
+
 
 # CORS ------------------------------------------------------------------------
 
@@ -107,7 +113,9 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=_settings_boot.allowed_origins_list or [],
     allow_credentials=False,
-    allow_methods=["POST", "GET", "OPTIONS"],
+    # Project / image / labelset routes use PATCH, PUT, DELETE in addition
+    # to the existing GET/POST surface.
+    allow_methods=["GET", "POST", "PATCH", "PUT", "DELETE", "OPTIONS"],
     allow_headers=["*"],
     expose_headers=[
         "X-Normalize-Duration-Ms",
@@ -128,6 +136,35 @@ async def service_error_handler(_: Request, exc: ServiceError) -> JSONResponse:
     return JSONResponse(
         status_code=exc.status,
         content={"error": exc.code, "message": exc.message},
+    )
+
+
+@app.exception_handler(ValueError)
+async def value_error_handler(_: Request, exc: ValueError) -> JSONResponse:
+    """ValueErrors propagate up from ``app.storage`` when a malicious id
+    contains path separators or ``..``. Map to 400 invalid_input so the
+    client sees the same envelope as other validation failures.
+    """
+    return JSONResponse(
+        status_code=400,
+        content={"error": "invalid_input", "message": str(exc)},
+    )
+
+
+@app.exception_handler(RequestValidationError)
+async def request_validation_handler(
+    _: Request, exc: RequestValidationError
+) -> JSONResponse:
+    """Pydantic schema failures default to FastAPI's own 422 envelope with
+    a `detail` array. Override so every non-2xx response across the API
+    keeps the contract envelope (`error` + `message`).
+    """
+    return JSONResponse(
+        status_code=422,
+        content={
+            "error": "invalid_input",
+            "message": "request body failed validation",
+        },
     )
 
 

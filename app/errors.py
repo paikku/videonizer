@@ -19,6 +19,20 @@ class SegmentError(ServiceError):
     """Errors raised by the /v1/segment pipeline."""
 
 
+# General-purpose errors used by project / resource / image / labelset
+# routes. These map to the codes documented in API_CONTRACT.md §0.
+
+
+class NotFoundError(ServiceError):
+    def __init__(self, message: str = "not found") -> None:
+        super().__init__("not_found", message, 404)
+
+
+class BadRequestError(ServiceError):
+    def __init__(self, message: str = "invalid input") -> None:
+        super().__init__("invalid_input", message, 400)
+
+
 class UploadTooLarge(NormalizeError):
     def __init__(self, limit: int) -> None:
         super().__init__(
