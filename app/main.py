@@ -64,6 +64,8 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     app.state.jobs_lock = asyncio.Lock()
     app.state.ffmpeg_ok = await _check_binary(settings.ffmpeg_path)
     app.state.ffprobe_ok = await _check_binary(settings.ffprobe_path)
+    app.state.db_ok = False
+    app.state.blob_ok = False
 
     # Wire the segmentation registry to the configured weights dir (if any),
     # then optionally pre-warm requested backends so the first request doesn't
@@ -83,6 +85,27 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         except Exception:  # noqa: BLE001
             logger.exception("segment.preload.failed", extra={"model": model_id})
 
+    # Stateful API bootstrap. Both DATABASE_URL and S3_ENDPOINT must be set;
+    # otherwise we leave the legacy /v1/* routes working without DB/S3.
+    if settings.stateful_api_enabled:
+        try:
+            await _init_stateful(settings)
+            app.state.db_ok = True
+            app.state.blob_ok = True
+            logger.info(
+                "stateful.ready",
+                extra={
+                    "database_url_dialect": settings.database_url.split(":", 1)[0],
+                    "s3_endpoint": settings.s3_endpoint,
+                    "s3_bucket": settings.s3_bucket,
+                },
+            )
+        except Exception:
+            logger.exception("stateful.bootstrap_failed")
+            # Re-raise: refusing to come up is better than serving 5xx for
+            # every /api/* call. Set both flags to false so /healthz reports.
+            raise
+
     logger.info(
         "startup",
         extra={
@@ -92,9 +115,63 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             "ffmpeg_ok": app.state.ffmpeg_ok,
             "ffprobe_ok": app.state.ffprobe_ok,
             "segment_max_concurrent": settings.segment_max_concurrent,
+            "stateful_api_enabled": settings.stateful_api_enabled,
+            "db_ok": app.state.db_ok,
+            "blob_ok": app.state.blob_ok,
         },
     )
-    yield
+    try:
+        yield
+    finally:
+        if settings.stateful_api_enabled:
+            await _shutdown_stateful()
+
+
+async def _init_stateful(settings: Settings) -> None:
+    """Open DB engine, run migrations, ensure bucket. Called from lifespan
+    only when both DATABASE_URL and S3_ENDPOINT are set.
+    """
+    from .storage import db as db_mod
+    from .storage.blobs import S3BlobStore, set_blob_store
+
+    db_mod.init_engine(settings.database_url)
+    await db_mod.ping()
+
+    if settings.auto_migrate:
+        await _run_migrations(settings.database_url)
+
+    store = S3BlobStore(
+        endpoint=settings.s3_endpoint,
+        region=settings.s3_region,
+        bucket=settings.s3_bucket,
+        access_key=settings.s3_access_key,
+        secret_key=settings.s3_secret_key,
+        force_path_style=settings.s3_force_path_style,
+    )
+    await store.ensure_bucket()
+    set_blob_store(store)
+
+
+async def _shutdown_stateful() -> None:
+    from .storage import db as db_mod
+    from .storage.blobs import set_blob_store
+
+    set_blob_store(None)
+    await db_mod.dispose_engine()
+
+
+async def _run_migrations(database_url: str) -> None:
+    """Run alembic upgrade head in a worker thread. Alembic's API is sync."""
+
+    def _do() -> None:
+        from alembic import command
+        from alembic.config import Config
+
+        cfg = Config("alembic.ini")
+        cfg.set_main_option("sqlalchemy.url", database_url)
+        command.upgrade(cfg, "head")
+
+    await asyncio.to_thread(_do)
 
 
 app = FastAPI(title="Videonizer Normalize Service", version="0.1.0", lifespan=lifespan)
@@ -107,7 +184,7 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=_settings_boot.allowed_origins_list or [],
     allow_credentials=False,
-    allow_methods=["POST", "GET", "OPTIONS"],
+    allow_methods=["GET", "POST", "PATCH", "PUT", "DELETE", "OPTIONS"],
     allow_headers=["*"],
     expose_headers=[
         "X-Normalize-Duration-Ms",

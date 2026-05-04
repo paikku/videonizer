@@ -52,6 +52,28 @@ class Settings(BaseSettings):
     # Eagerly load these backends at startup (comma-separated public model ids).
     segment_preload_models: str = ""
 
+    # --- Stateful API (PR #1+) ---------------------------------------------
+    # SQLAlchemy URL. Empty disables the stateful API entirely; legacy /v1/*
+    # keeps working without DB/S3. Production: postgresql+asyncpg://...
+    database_url: str = ""
+    # Run alembic upgrade head on startup. Disable in multi-replica deploys.
+    auto_migrate: bool = True
+    # Filesystem root for non-DB, non-S3 state (currently just upload tmp).
+    data_dir: str = ""
+
+    # --- Object storage (S3 / MinIO) ---------------------------------------
+    s3_endpoint: str = ""
+    s3_region: str = "us-east-1"
+    s3_bucket: str = "videonizer"
+    s3_access_key: str = ""
+    s3_secret_key: str = ""
+    # MinIO (and most non-AWS impls) require path-style URLs.
+    s3_force_path_style: bool = True
+
+    @property
+    def stateful_api_enabled(self) -> bool:
+        return bool(self.database_url) and bool(self.s3_endpoint)
+
     @property
     def allowed_origins_list(self) -> list[str]:
         return [o.strip() for o in self.allowed_origins.split(",") if o.strip()]

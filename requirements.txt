@@ -5,6 +5,14 @@ pydantic==2.10.4
 pydantic-settings==2.7.0
 prometheus-client==0.21.1
 
+# --- Stateful API (PR #1+) --------------------------------------------------
+# Postgres (asyncpg) for production; aiosqlite for tests / single-file dev.
+sqlalchemy[asyncio]==2.0.49
+asyncpg==0.30.0
+aiosqlite==0.20.0
+alembic==1.18.4
+boto3==1.43.2
+
 # --- Segmentation (CPU-only) -------------------------------------------------
 numpy==1.26.4
 pillow==11.0.0
